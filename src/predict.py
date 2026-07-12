@@ -33,13 +33,18 @@ import joblib
 import pandas as pd
 
 from src.pipeline import (
+    ELO_INITIAL as ELO_INITIAL_FALLBACK,
+    add_elo_ratings,
     add_h2h,
     add_map_advantage,
     add_player_rolling_form,
+    add_rest_days,
+    add_streak,
     add_team_form,
     build_player_match_agg,
     build_team_map_match_agg,
     build_team_match_long,
+    compute_current_team_state,
 )
 
 logging.basicConfig(
@@ -99,6 +104,10 @@ class Predictor:
         matches = pd.read_parquet(self.cfg.processed_dir / "matches_summary.parquet")
 
         self.team_long = add_h2h(add_team_form(build_team_match_long(matches), self.cfg.form_windows))
+        self.team_long = add_elo_ratings(self.team_long)
+        self.team_long = add_rest_days(self.team_long)
+        self.team_long = add_streak(self.team_long)
+        self.current_state = compute_current_team_state(self.team_long).set_index("team_name")
         self.team_map_long = add_map_advantage(build_team_map_match_agg(maps))
 
         player_match = build_player_match_agg(maps)
@@ -186,6 +195,17 @@ class Predictor:
             "roster_avg_experience": float(len(latest_stats)),
         }
 
+    def _current_state_snapshot(self, team_name: str) -> dict:
+        if team_name not in self.current_state.index:
+            return {"elo": ELO_INITIAL_FALLBACK, "streak": 0.0, "rest_days": 60.0}
+        row = self.current_state.loc[team_name]
+        rest_days = (pd.Timestamp.now(tz=None) - row["last_match_datetime"]).total_seconds() / 86400.0
+        return {
+            "elo": float(row["current_elo"]),
+            "streak": float(row["current_streak"]),
+            "rest_days": float(min(max(rest_days, 0.0), 60.0)),
+        }
+
     # ----------------------------------------------------------------- #
     def _build_feature_row(self, team1: str, team2: str, map_name: str, tier: str, best_of: int) -> pd.DataFrame:
         t1_form = self._team_form_snapshot(team1)
@@ -195,6 +215,8 @@ class Predictor:
         t2_map = self._map_snapshot(team2, map_name)
         t1_fp = self._firepower_snapshot(team1)
         t2_fp = self._firepower_snapshot(team2)
+        t1_state = self._current_state_snapshot(team1)
+        t2_state = self._current_state_snapshot(team2)
 
         row = {
             "team1_form_last5": t1_form["form_last5"], "team1_form_last10": t1_form["form_last10"],
@@ -218,6 +240,12 @@ class Predictor:
             "diff_team_adr_form": t1_fp["team_adr_form"] - t2_fp["team_adr_form"],
             "diff_team_kast_form": t1_fp["team_kast_form"] - t2_fp["team_kast_form"],
             "diff_team_kddiff_form": t1_fp["team_kddiff_form"] - t2_fp["team_kddiff_form"],
+            "team1_elo": t1_state["elo"], "team2_elo": t2_state["elo"],
+            "team1_rest_days": t1_state["rest_days"], "team2_rest_days": t2_state["rest_days"],
+            "team1_streak": t1_state["streak"], "team2_streak": t2_state["streak"],
+            "diff_elo": t1_state["elo"] - t2_state["elo"],
+            "diff_rest_days": t1_state["rest_days"] - t2_state["rest_days"],
+            "diff_streak": t1_state["streak"] - t2_state["streak"],
             "map_name": map_name, "tier": tier, "bestOf": str(best_of),
         }
 

@@ -22,6 +22,12 @@
     "team2_team_kddiff_form",
     "team1_roster_avg_experience",
     "team2_roster_avg_experience",
+    "team1_elo",
+    "team2_elo",
+    "team1_rest_days",
+    "team2_rest_days",
+    "team1_streak",
+    "team2_streak",
     "diff_form_last5",
     "diff_form_last10",
     "diff_form_career",
@@ -30,6 +36,9 @@
     "diff_team_adr_form",
     "diff_team_kast_form",
     "diff_team_kddiff_form",
+    "diff_elo",
+    "diff_rest_days",
+    "diff_streak",
     "map_name",
     "tier",
     "bestOf"
@@ -55,6 +64,12 @@
     "team2_team_kddiff_form",
     "team1_roster_avg_experience",
     "team2_roster_avg_experience",
+    "team1_elo",
+    "team2_elo",
+    "team1_rest_days",
+    "team2_rest_days",
+    "team1_streak",
+    "team2_streak",
     "diff_form_last5",
     "diff_form_last10",
     "diff_form_career",
@@ -62,7 +77,10 @@
     "diff_h2h_win_rate",
     "diff_team_adr_form",
     "diff_team_kast_form",
-    "diff_team_kddiff_form"
+    "diff_team_kddiff_form",
+    "diff_elo",
+    "diff_rest_days",
+    "diff_streak"
   ],
   "categorical_features": [
     "map_name",
@@ -80,9 +98,9 @@
   ],
   "test_metrics_calibrated": {
     "model": "Logistic Regression (baseline) (final)",
-    "roc_auc": 0.6397465143339731,
-    "log_loss": 0.6594629003348514,
-    "brier_score": 0.23357842430769601,
-    "accuracy_at_0.5": 0.6104868913857678
+    "roc_auc": 0.645940784554646,
+    "log_loss": 0.6563708183876554,
+    "brier_score": 0.23207585917672052,
+    "accuracy_at_0.5": 0.6123595505617978
   }
 }

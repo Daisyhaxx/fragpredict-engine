@@ -185,6 +185,136 @@ def add_h2h(team_long: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Feature 5: Elo Rating (maç sonuçlarına göre iteratif olarak güncellenen güç puanı)
+# --------------------------------------------------------------------------- #
+# Elo sabitleri modül seviyesinde -- hem add_elo_ratings hem de predict.py'deki
+# "güncel Elo" hesaplaması AYNI sabitleri kullanmalı, yoksa tutarsızlık oluşur.
+ELO_K_FACTOR = 24.0
+ELO_INITIAL = 1500.0
+
+
+def _elo_expected(r_self: float, r_opp: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((r_opp - r_self) / 400.0))
+
+
+def add_elo_ratings(team_long: pd.DataFrame, k_factor: float = ELO_K_FACTOR, initial_elo: float = ELO_INITIAL) -> pd.DataFrame:
+    """Klasik Elo güncellemesi. Her maç KRONOLOJİK sırayla işlenir; bir takımın Elo'su
+    SADECE o maçtan SONRA güncellenir -- yani her satıra yazılan değer, o maça
+    GİRERKENKİ (maç öncesi) Elo'dur. Bu doğası gereği leakage-free bir yöntemdir
+    (rolling/shift'e ihtiyaç duymaz, çünkü Elo zaten sıralı/iteratif hesaplanır).
+    """
+    # Her maçı bir kez işleyeceğiz (iki perspektif satırından sadece team1 tarafını
+    # kullanmak yeterli -- team2'nin güncellemesi de aynı döngüde yapılacak).
+    matches = (
+        team_long[team_long["team_id"].notna()]  # güvence: tüm satırlar zaten dolu
+        .drop_duplicates(subset=["match_id"])
+        .sort_values("datetime")[["match_id", "datetime", "team_name", "opponent_name", "match_win"]]
+    )
+
+    elo: dict[str, float] = {}
+    pre_match_elo_self: list[float] = []
+    pre_match_elo_opp: list[float] = []
+
+    for row in matches.itertuples(index=False):
+        r_self = elo.get(row.team_name, initial_elo)
+        r_opp = elo.get(row.opponent_name, initial_elo)
+
+        pre_match_elo_self.append(r_self)
+        pre_match_elo_opp.append(r_opp)
+
+        expected_self = _elo_expected(r_self, r_opp)
+        actual_self = float(row.match_win)
+
+        elo[row.team_name] = r_self + k_factor * (actual_self - expected_self)
+        elo[row.opponent_name] = r_opp + k_factor * ((1 - actual_self) - (1 - expected_self))
+
+    matches = matches.copy()
+    matches["elo_self"] = pre_match_elo_self
+    matches["elo_opp"] = pre_match_elo_opp
+
+    # team1 perspektifinden hesapladık; team2 perspektifi için ayna (mirror) satırlar üretiyoruz
+    team1_side = matches.rename(columns={"team_name": "team_name", "elo_self": "elo", "elo_opp": "opponent_elo"})
+    team2_side = matches.rename(columns={"opponent_name": "team_name_tmp"})
+    team2_side = team2_side.assign(
+        team_name=matches["opponent_name"], opponent_name_tmp=matches["team_name"],
+        elo=matches["elo_opp"], opponent_elo=matches["elo_self"],
+    )[["match_id", "datetime", "team_name", "elo", "opponent_elo"]]
+
+    team1_side = team1_side[["match_id", "datetime", "team_name", "elo", "opponent_elo"]]
+    elo_long = pd.concat([team1_side, team2_side], ignore_index=True)
+
+    team_long = team_long.merge(elo_long, on=["match_id", "team_name", "datetime"], how="left")
+    return team_long
+
+
+# --------------------------------------------------------------------------- #
+# Feature 6: Rest Days (son maçtan bu yana kaç gün geçti -- yorgunluk/maç trafiği)
+# --------------------------------------------------------------------------- #
+def add_rest_days(team_long: pd.DataFrame, cap_days: float = 60.0) -> pd.DataFrame:
+    team_long = team_long.sort_values(["team_name", "datetime"]).copy()
+    grp = team_long.groupby("team_name")["datetime"]
+    prev_datetime = grp.shift(1)
+    rest = (team_long["datetime"] - prev_datetime).dt.total_seconds() / 86400.0
+    # İlk maç (geçmişi yok) ya da çok uzun aralar (sezon arası) -> cap_days ile sınırla,
+    # aksi halde outlier'lar modelin bu feature'a aşırı ağırlık vermesine yol açabilir.
+    team_long["rest_days"] = rest.clip(upper=cap_days).fillna(cap_days)
+    return team_long
+
+
+# --------------------------------------------------------------------------- #
+# Feature 7: Win/Loss Streak (mevcut galibiyet[+] / mağlubiyet[-] serisi uzunluğu)
+# --------------------------------------------------------------------------- #
+def _streak_from_results(results: pd.Series) -> pd.Series:
+    """[1,1,0,1,1,1] -> [0,1,2,0,1,2,3] (shift edilmemiş ham seri, çağıran shift eder)."""
+    streaks = []
+    current = 0
+    for won in results:
+        streaks.append(current)
+        if won == 1:
+            current = current + 1 if current >= 0 else 1
+        else:
+            current = current - 1 if current <= 0 else -1
+    return pd.Series(streaks, index=results.index)
+
+
+def add_streak(team_long: pd.DataFrame) -> pd.DataFrame:
+    team_long = team_long.sort_values(["team_name", "datetime"]).copy()
+    # DİKKAT: _streak_from_results, her satır için ÖNCE o ana kadarki seriyi kaydedip
+    # SONRA güncelliyor -- yani fonksiyonun kendisi zaten "bu maçtan önceki seri"
+    # mantığını taşıyor. Üstüne ekstra shift(1) uygulamak ÇİFTE kaydırma hatası olurdu.
+    team_long["streak"] = team_long.groupby("team_name")["match_win"].transform(_streak_from_results)
+    return team_long
+
+
+def _next_streak(current: float, won: int) -> float:
+    """add_streak'teki güncelleme kuralının aynısı -- tek bir sonraki adımı hesaplar
+    (predict.py'nin 'şu anki güncel seri' snapshot'ı için kullanılır)."""
+    if won == 1:
+        return current + 1 if current >= 0 else 1
+    return current - 1 if current <= 0 else -1
+
+
+def compute_current_team_state(team_long: pd.DataFrame) -> pd.DataFrame:
+    """Her takım için EN GÜNCEL (son bilinen maçtan SONRAKİ) Elo ve seri durumunu üretir.
+    team_long'daki 'elo'/'streak' kolonları o maça GİRERKENKİ değerdir; burada son
+    maçın gerçek sonucunu da işleyerek bir adım ileri taşıyoruz -- predict.py'nin
+    henüz oynanmamış bir maç için ihtiyaç duyduğu 'bugün itibarıyla' durum budur.
+    """
+    last_rows = (
+        team_long.sort_values("datetime")
+        .groupby("team_name", as_index=False)
+        .last()[["team_name", "datetime", "elo", "opponent_elo", "streak", "match_win"]]
+    )
+    expected = last_rows.apply(lambda r: _elo_expected(r["elo"], r["opponent_elo"]), axis=1)
+    last_rows["current_elo"] = last_rows["elo"] + ELO_K_FACTOR * (last_rows["match_win"] - expected)
+    last_rows["current_streak"] = last_rows.apply(
+        lambda r: _next_streak(r["streak"], int(r["match_win"])), axis=1
+    )
+    last_rows = last_rows.rename(columns={"datetime": "last_match_datetime"})
+    return last_rows[["team_name", "last_match_datetime", "current_elo", "current_streak"]]
+
+
+# --------------------------------------------------------------------------- #
 # Feature 4: Player Firepower (rolling avg ADR/KAST/KDDIFF per player, shifted)
 # --------------------------------------------------------------------------- #
 def add_player_rolling_form(player_match: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -223,7 +353,10 @@ def assemble_match_level_features(
 ) -> pd.DataFrame:
     """team1_* / team2_* olarak maç başına tek satırlık feature tablosu üretir."""
 
-    form_cols = [c for c in team_long.columns if c.startswith("form_")] + ["h2h_win_rate", "h2h_matches_played"]
+    form_cols = (
+        [c for c in team_long.columns if c.startswith("form_")]
+        + ["h2h_win_rate", "h2h_matches_played", "elo", "opponent_elo", "rest_days", "streak"]
+    )
     team_side = team_long[["match_id", "team_name"] + form_cols]
 
     out = matches[["match_id", "datetime", "tier", "team1_id", "team2_id", "team1", "team2", "team1_match_win"]].copy()
@@ -274,11 +407,19 @@ def attach_map_features(maps: pd.DataFrame, match_features: pd.DataFrame, team_m
     for c in perf_cols:
         df[c] = df[c].fillna(df[c].median())
 
+    # Yeni takım (hiç Elo geçmişi yok) -> başlangıç Elo'su (1500)
+    for side in ("team1", "team2"):
+        df[f"{side}_elo"] = df[f"{side}_elo"].fillna(1500.0)
+        df[f"{side}_opponent_elo"] = df[f"{side}_opponent_elo"].fillna(1500.0)
+        df[f"{side}_rest_days"] = df[f"{side}_rest_days"].fillna(60.0)
+        df[f"{side}_streak"] = df[f"{side}_streak"].fillna(0.0)
+
     # Fark (diff) kolonları -> modelin doğrudan "kim daha iyi" sinyalini görmesi için
     diff_pairs = [
         ("form_last5", "form_last5"), ("form_last10", "form_last10"), ("form_career", "form_career"),
         ("map_win_rate", "map_win_rate"), ("team_adr_form", "team_adr_form"),
         ("team_kast_form", "team_kast_form"), ("team_kddiff_form", "team_kddiff_form"),
+        ("elo", "elo"), ("rest_days", "rest_days"), ("streak", "streak"),
     ]
     for base, _ in diff_pairs:
         df[f"diff_{base}"] = df[f"team1_{base}"] - df[f"team2_{base}"]
@@ -300,6 +441,9 @@ def run(cfg: FeatureConfig) -> pd.DataFrame:
     team_long = build_team_match_long(matches)
     team_long = add_team_form(team_long, cfg.form_windows)
     team_long = add_h2h(team_long)
+    team_long = add_elo_ratings(team_long)
+    team_long = add_rest_days(team_long)
+    team_long = add_streak(team_long)
 
     logger.info("Team-map long format inşa ediliyor (Map Advantage)...")
     team_map_long = build_team_map_match_agg(maps)

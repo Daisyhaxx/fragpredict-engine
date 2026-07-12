@@ -32,6 +32,7 @@ import joblib
 import lightgbm as lgb
 import matplotlib
 import numpy as np
+import optuna
 import pandas as pd
 import xgboost as xgb
 
@@ -40,6 +41,7 @@ import matplotlib.pyplot as plt
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 
 logging.basicConfig(
@@ -62,6 +64,9 @@ class TrainConfig:
     # test_frac = 1 - train_frac - val_frac
 
     target_col: str = "team1_map_win"
+    tune_hyperparams: bool = True
+    optuna_n_trials: int = 40
+    optuna_n_splits: int = 4
 
     numeric_features: tuple = (
         "team1_form_last5", "team1_form_last10", "team1_form_career",
@@ -72,9 +77,12 @@ class TrainConfig:
         "team1_team_adr_form", "team1_team_kast_form", "team1_team_kddiff_form",
         "team2_team_adr_form", "team2_team_kast_form", "team2_team_kddiff_form",
         "team1_roster_avg_experience", "team2_roster_avg_experience",
+        "team1_elo", "team2_elo", "team1_rest_days", "team2_rest_days",
+        "team1_streak", "team2_streak",
         "diff_form_last5", "diff_form_last10", "diff_form_career",
         "diff_map_win_rate", "diff_h2h_win_rate",
         "diff_team_adr_form", "diff_team_kast_form", "diff_team_kddiff_form",
+        "diff_elo", "diff_rest_days", "diff_streak",
     )
     categorical_features: tuple = ("map_name", "tier", "bestOf")
 
@@ -126,16 +134,63 @@ def get_xy(df: pd.DataFrame, cfg: TrainConfig, feature_cols: list):
 
 
 # --------------------------------------------------------------------------- #
+# Hiperparametre optimizasyonu (Optuna, ZAMAN-SERİSİ uyumlu CV)
+# --------------------------------------------------------------------------- #
+def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int, n_splits: int) -> dict:
+    """XGBoost hiperparametrelerini Optuna ile arar.
+
+    KRİTİK: sklearn'ün varsayılan KFold'u RASTGELE böler -- zaman serisi verisinde bu,
+    geleceğin geçmişi tahmin etmek için kullanılmasına (leakage) yol açar. Bunun yerine
+    TimeSeriesSplit kullanıyoruz: her fold'da eğitim seti SADECE validasyon setinden
+    KRONOLOJİK OLARAK ÖNCEKİ verilerden oluşur (expanding window).
+    """
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
+    def objective(trial: optuna.Trial) -> float:
+        params = {
+            "n_estimators": trial.suggest_int("n_estimators", 100, 600),
+            "max_depth": trial.suggest_int("max_depth", 2, 6),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 10.0, log=True),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 20),
+        }
+        fold_losses = []
+        for fold_train_idx, fold_val_idx in tscv.split(X_train):
+            X_tr, X_va = X_train.iloc[fold_train_idx], X_train.iloc[fold_val_idx]
+            y_tr, y_va = y_train.iloc[fold_train_idx], y_train.iloc[fold_val_idx]
+            model = xgb.XGBClassifier(
+                **params, eval_metric="logloss", enable_categorical=True,
+                tree_method="hist", random_state=42,
+            )
+            model.fit(X_tr, y_tr)
+            proba = model.predict_proba(X_va)[:, 1]
+            fold_losses.append(log_loss(y_va, proba))
+        return float(np.mean(fold_losses))
+
+    study = optuna.create_study(direction="minimize", study_name="xgboost_cs2")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+
+    logger.info("Optuna tamamlandı -> %d deneme, en iyi ortalama fold LogLoss: %.4f",
+                n_trials, study.best_value)
+    logger.info("En iyi hiperparametreler: %s", study.best_params)
+    return study.best_params
+
+
+# --------------------------------------------------------------------------- #
 # Model eğitimi
 # --------------------------------------------------------------------------- #
-def train_xgboost(X_train, y_train, X_val, y_val) -> xgb.XGBClassifier:
+def train_xgboost(X_train, y_train, X_val, y_val, params: dict | None = None) -> xgb.XGBClassifier:
+    default_params = dict(
+        n_estimators=500, max_depth=4, learning_rate=0.03,
+        subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
+    )
+    final_params = {**default_params, **(params or {})}
     model = xgb.XGBClassifier(
-        n_estimators=500,
-        max_depth=4,
-        learning_rate=0.03,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
+        **final_params,
         eval_metric="logloss",
         enable_categorical=True,
         tree_method="hist",
@@ -302,10 +357,21 @@ def run(cfg: TrainConfig) -> None:
     logreg_proba = log_model.predict_proba(scaler.transform(X_test[numeric_cols].fillna(0.5)))[:, 1]
     results = [evaluate("Logistic Regression (baseline)", y_test, logreg_proba)]
 
-    # ---- XGBoost ----
+    # ---- XGBoost (varsayılan hiperparametreler) ----
     xgb_model = train_xgboost(X_train, y_train, X_val, y_val)
     xgb_proba = xgb_model.predict_proba(X_test)[:, 1]
-    results.append(evaluate("XGBoost", y_test, xgb_proba))
+    results.append(evaluate("XGBoost (varsayılan)", y_test, xgb_proba))
+
+    # ---- XGBoost (Optuna ile ayarlanmış hiperparametreler) ----
+    if cfg.tune_hyperparams:
+        logger.info("--- Optuna hiperparametre araması başlıyor (%d deneme, %d fold, zaman-serisi CV) ---",
+                    cfg.optuna_n_trials, cfg.optuna_n_splits)
+        best_params = tune_xgboost_optuna(X_train, y_train, cfg.optuna_n_trials, cfg.optuna_n_splits)
+        xgb_tuned_model = train_xgboost(X_train, y_train, X_val, y_val, params=best_params)
+        xgb_tuned_proba = xgb_tuned_model.predict_proba(X_test)[:, 1]
+        results.append(evaluate("XGBoost (Optuna-tuned)", y_test, xgb_tuned_proba))
+    else:
+        xgb_tuned_model = None
 
     # ---- LightGBM ----
     lgb_model = train_lightgbm(X_train, y_train, X_val, y_val, list(cfg.categorical_features))
@@ -317,7 +383,12 @@ def run(cfg: TrainConfig) -> None:
 
     # ---- En iyi modeli seç (log_loss'a göre) ----
     best_name = results_df["log_loss"].idxmin()
-    best_raw_model = {"XGBoost": xgb_model, "LightGBM": lgb_model}.get(best_name, xgb_model)
+    candidate_models = {
+        "XGBoost (varsayılan)": xgb_model, "LightGBM": lgb_model,
+    }
+    if xgb_tuned_model is not None:
+        candidate_models["XGBoost (Optuna-tuned)"] = xgb_tuned_model
+    best_raw_model = candidate_models.get(best_name, xgb_model)
     logger.info("Kazanan model: %s", best_name)
 
     # ---- Kalibrasyon (seçim validation'da yapılır, test setine dokunulmaz) ----
@@ -353,7 +424,7 @@ def run(cfg: TrainConfig) -> None:
 
     plot_calibration_curve(y_test, raw_best_proba, calibrated_proba, cfg.output_dir / "calibration_curve.png")
 
-    if best_name in ("XGBoost", "LightGBM"):
+    if best_name in candidate_models:
         plot_feature_importance(best_raw_model, feature_cols, cfg.output_dir / "feature_importance.png")
 
     logger.info("Eğitim tamamlandı. Tüm çıktılar -> %s", cfg.output_dir)
