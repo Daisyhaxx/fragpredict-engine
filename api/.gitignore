@@ -1,0 +1,22 @@
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# PyCharm
+.idea/
+
+# Veri -- büyük ve script'lerle yeniden üretilebilir (eda_cleaning.py / pipeline.py)
+data/raw/
+data/processed/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
