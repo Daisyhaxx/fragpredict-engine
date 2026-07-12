@@ -1,0 +1,17 @@
+# --- Data & ML core ---
+pandas
+numpy
+pyarrow
+scikit-learn
+xgboost
+lightgbm
+catboost
+optuna
+joblib
+matplotlib
+
+# --- API layer ---
+fastapi
+uvicorn
+supabase
+python-dotenv
