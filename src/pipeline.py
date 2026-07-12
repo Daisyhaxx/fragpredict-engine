@@ -45,6 +45,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
+# Elo sabitleri modül seviyesinde -- hem add_elo_ratings/add_map_elo hem de predict.py'deki
+# "güncel Elo" hesaplaması AYNI sabitleri kullanmalı, yoksa tutarsızlık oluşur.
+ELO_K_FACTOR = 24.0
+ELO_INITIAL = 1500.0
+
+
+def _elo_expected(r_self: float, r_opp: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((r_opp - r_self) / 400.0))
+
 
 @dataclass
 class FeatureConfig:
@@ -91,9 +100,9 @@ def build_team_map_match_agg(maps: pd.DataFrame) -> pd.DataFrame:
     Grup anahtarı team_name'dir (bkz. build_team_match_long'daki not: team_id güvenilmez).
     """
     rows = []
-    for side in ("team1", "team2"):
-        sub = maps[["match_id", "datetime", "map_name", side]].copy()
-        sub = sub.rename(columns={side: "team_name"})
+    for side, opp_side in (("team1", "team2"), ("team2", "team1")):
+        sub = maps[["match_id", "datetime", "map_name", side, opp_side]].copy()
+        sub = sub.rename(columns={side: "team_name", opp_side: "opponent_name"})
         sub["map_win"] = maps["team1_map_win"] if side == "team1" else (1 - maps["team1_map_win"])
         rows.append(sub)
     long_df = pd.concat(rows, ignore_index=True)
@@ -102,7 +111,9 @@ def build_team_map_match_agg(maps: pd.DataFrame) -> pd.DataFrame:
     # Map-advantage feature'ı (match_id, team_name, map_name) bazında BENZERSİZ anahtar
     # gerektirir; bu durumda o maçtaki performansı ortalayarak tek satıra indirgiyoruz.
     before = len(long_df)
-    long_df = long_df.groupby(["match_id", "team_name", "map_name", "datetime"], as_index=False)["map_win"].mean()
+    long_df = long_df.groupby(
+        ["match_id", "team_name", "opponent_name", "map_name", "datetime"], as_index=False
+    )["map_win"].mean()
     if before != len(long_df):
         logger.warning("Aynı maç içinde tekrar oynanan harita(lar) nedeniyle %d satır birleştirildi.", before - len(long_df))
 
@@ -174,6 +185,75 @@ def add_map_advantage(team_map_long: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Feature 9: Harita-özel Elo (genel Elo'dan farklı olarak SADECE o haritadaki
+# maçlarla güncellenir -- bir takımın Mirage'daki gücü, Inferno'daki gücünden
+# bağımsız olarak izlenir)
+# --------------------------------------------------------------------------- #
+def add_map_elo(team_map_long: pd.DataFrame, k_factor: float = ELO_K_FACTOR, initial_elo: float = ELO_INITIAL) -> pd.DataFrame:
+    """add_elo_ratings ile AYNI mantık, tek fark: Elo defteri (dict) her harita için
+    AYRI tutulur -- yani bir takımın 'Mirage Elo'su' sadece Mirage maçlarıyla,
+    'Inferno Elo'su' sadece Inferno maçlarıyla güncellenir.
+
+    KRİTİK: team_map_long'da her (match_id, map_name) için İKİ satır var (team1
+    perspektifi + team2 perspektifi -- aynaları). Döngüde bir maçı SADECE BİR KEZ
+    işlemek şart; aksi halde ikinci (ayna) satır, ilk satırın güncellediği Elo'yu
+    'maç öncesi' zannedip okur -- bu da maçın kendi sonucunun sızmasına yol açar
+    (yaşanmış bir bug: AUC'de gerçekçi olmayan bir sıçramaya sebep olmuştu).
+    Bu yüzden add_elo_ratings'teki gibi ÖNCE (match_id, map_name) bazında TEK
+    satıra (team1 perspektifi) indirgeyip, döngüde HER İKİ takımı birlikte
+    güncelliyoruz; ayna satırlar döngüden SONRA, ayrıca üretiliyor.
+    """
+    single_side = team_map_long.drop_duplicates(subset=["match_id", "map_name"]).sort_values("datetime")
+
+    elo: dict[tuple[str, str], float] = {}  # (team_name, map_name) -> rating
+    pre_elo_self: list[float] = []
+    pre_elo_opp: list[float] = []
+
+    for row in single_side.itertuples(index=False):
+        key_self = (row.team_name, row.map_name)
+        key_opp = (row.opponent_name, row.map_name)
+        r_self = elo.get(key_self, initial_elo)
+        r_opp = elo.get(key_opp, initial_elo)
+
+        pre_elo_self.append(r_self)
+        pre_elo_opp.append(r_opp)
+
+        expected_self = _elo_expected(r_self, r_opp)
+        actual_self = float(row.map_win)
+
+        elo[key_self] = r_self + k_factor * (actual_self - expected_self)
+        elo[key_opp] = r_opp + k_factor * ((1 - actual_self) - (1 - expected_self))
+
+    single_side = single_side.copy()
+    single_side["map_elo"] = pre_elo_self
+    single_side["opponent_map_elo"] = pre_elo_opp
+
+    # team1 perspektifinden hesapladık; team2 (ayna) perspektifi için karşılık üretiyoruz
+    team1_side = single_side[["match_id", "map_name", "team_name", "map_elo", "opponent_map_elo"]]
+    team2_side = single_side[["match_id", "map_name", "opponent_name", "opponent_map_elo", "map_elo"]].rename(
+        columns={"opponent_name": "team_name", "opponent_map_elo": "map_elo", "map_elo": "opponent_map_elo"}
+    )
+    elo_long = pd.concat([team1_side, team2_side], ignore_index=True)
+
+    team_map_long = team_map_long.merge(elo_long, on=["match_id", "map_name", "team_name"], how="left")
+    return team_map_long
+
+
+def compute_current_map_elo(team_map_long: pd.DataFrame) -> pd.DataFrame:
+    """compute_current_team_state'in harita-özel versiyonu -- predict.py'nin henüz
+    oynanmamış bir maç için 'bugün itibarıyla bu takımın BU HARİTADAKİ Elo'su ne'
+    sorusuna cevap vermesini sağlar."""
+    last_rows = (
+        team_map_long.sort_values("datetime")
+        .groupby(["team_name", "map_name"], as_index=False)
+        .last()[["team_name", "map_name", "datetime", "map_elo", "opponent_map_elo", "map_win"]]
+    )
+    expected = last_rows.apply(lambda r: _elo_expected(r["map_elo"], r["opponent_map_elo"]), axis=1)
+    last_rows["current_map_elo"] = last_rows["map_elo"] + ELO_K_FACTOR * (last_rows["map_win"] - expected)
+    return last_rows[["team_name", "map_name", "current_map_elo"]]
+
+
+# --------------------------------------------------------------------------- #
 # Feature 3: Head-to-Head (expanding win rate against THIS specific opponent, shifted)
 # --------------------------------------------------------------------------- #
 def add_h2h(team_long: pd.DataFrame) -> pd.DataFrame:
@@ -187,16 +267,6 @@ def add_h2h(team_long: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Feature 5: Elo Rating (maç sonuçlarına göre iteratif olarak güncellenen güç puanı)
 # --------------------------------------------------------------------------- #
-# Elo sabitleri modül seviyesinde -- hem add_elo_ratings hem de predict.py'deki
-# "güncel Elo" hesaplaması AYNI sabitleri kullanmalı, yoksa tutarsızlık oluşur.
-ELO_K_FACTOR = 24.0
-ELO_INITIAL = 1500.0
-
-
-def _elo_expected(r_self: float, r_opp: float) -> float:
-    return 1.0 / (1.0 + 10 ** ((r_opp - r_self) / 400.0))
-
-
 def add_elo_ratings(team_long: pd.DataFrame, k_factor: float = ELO_K_FACTOR, initial_elo: float = ELO_INITIAL) -> pd.DataFrame:
     """Klasik Elo güncellemesi. Her maç KRONOLOJİK sırayla işlenir; bir takımın Elo'su
     SADECE o maçtan SONRA güncellenir -- yani her satıra yazılan değer, o maça
@@ -315,6 +385,34 @@ def compute_current_team_state(team_long: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Feature 8: Roster Stability (bir önceki maça göre kadro değişimi)
+# --------------------------------------------------------------------------- #
+def add_roster_stability(maps: pd.DataFrame) -> pd.DataFrame:
+    """Her (match_id, team_name) satırı için, takımın BİR ÖNCEKİ maçındaki kadroyla
+    kaç oyuncunun ORTAK olduğunu (0-5) hesaplar -- leakage-free (sadece geçmişe bakar)."""
+    rows = []
+    for side in ("team1", "team2"):
+        player_cols = [f"{side}_player{p}_id" for p in range(1, 6)]
+        sub = maps[["match_id", "datetime", side] + player_cols].rename(columns={side: "team_name"})
+        sub = sub.drop_duplicates(subset=["match_id", "team_name"]).copy()
+        sub["roster_set"] = sub[player_cols].apply(
+            lambda r: frozenset(p for p in r if pd.notna(p)), axis=1
+        )
+        rows.append(sub[["match_id", "datetime", "team_name", "roster_set"]])
+
+    roster_long = pd.concat(rows, ignore_index=True).sort_values(["team_name", "datetime"])
+    roster_long["prev_roster_set"] = roster_long.groupby("team_name")["roster_set"].shift(1)
+
+    def _overlap(row):
+        if pd.isna(row["prev_roster_set"]):
+            return None  # ilk maç -> geçmiş yok
+        return len(row["roster_set"] & row["prev_roster_set"])
+
+    roster_long["roster_overlap_prev"] = roster_long.apply(_overlap, axis=1)
+    return roster_long[["match_id", "team_name", "roster_overlap_prev"]]
+
+
+# --------------------------------------------------------------------------- #
 # Feature 4: Player Firepower (rolling avg ADR/KAST/KDDIFF per player, shifted)
 # --------------------------------------------------------------------------- #
 def add_player_rolling_form(player_match: pd.DataFrame, window: int) -> pd.DataFrame:
@@ -349,6 +447,7 @@ def assemble_match_level_features(
     team_long: pd.DataFrame,
     team_map_long: pd.DataFrame,
     team_fp: pd.DataFrame,
+    roster_stability: pd.DataFrame,
     cfg: FeatureConfig,
 ) -> pd.DataFrame:
     """team1_* / team2_* olarak maç başına tek satırlık feature tablosu üretir."""
@@ -368,6 +467,12 @@ def assemble_match_level_features(
         )
         for c in form_cols:
             out[f"{side}_{c}"] = merged[c].values
+
+        # Roster stability: match_id + team_name bazlı join
+        rs = out[["match_id", name_col]].merge(
+            roster_stability, left_on=["match_id", name_col], right_on=["match_id", "team_name"], how="left"
+        )
+        out[f"{side}_roster_overlap_prev"] = rs["roster_overlap_prev"].values
 
         # Player firepower: team_id burada sadece AYNI MAÇ içinde team1/team2 tarafını
         # ayırt etmek için kullanılıyor (bu kapsamda güvenli, çünkü çapraz-maç
@@ -391,6 +496,7 @@ def attach_map_features(maps: pd.DataFrame, match_features: pd.DataFrame, team_m
         merged = key.merge(team_map_long, on=["match_id", "team_name", "map_name"], how="left")
         df[f"{side}_map_win_rate"] = merged["map_win_rate"].values
         df[f"{side}_map_experience"] = merged["map_experience"].values
+        df[f"{side}_map_elo"] = merged["map_elo"].values
 
     # Eksik geçmiş -> global prior ile doldur (soğuk başlangıç / yeni takım problemi)
     fill_cols = [c for c in df.columns if c.endswith(("_win_rate", "form_career",
@@ -413,6 +519,11 @@ def attach_map_features(maps: pd.DataFrame, match_features: pd.DataFrame, team_m
         df[f"{side}_opponent_elo"] = df[f"{side}_opponent_elo"].fillna(1500.0)
         df[f"{side}_rest_days"] = df[f"{side}_rest_days"].fillna(60.0)
         df[f"{side}_streak"] = df[f"{side}_streak"].fillna(0.0)
+        # Roster overlap eksikse (takımın ilk maçı) -> "tam yeni kadro" varsayımı yerine
+        # nötr bir değer: 5 oyuncunun 3'ü aynı kalmış gibi (hafif iyimser bir öncül,
+        # aşırı karamsar bir sinyal vermemesi için ortalamaya yakın bir değer seçildi)
+        df[f"{side}_roster_overlap_prev"] = df[f"{side}_roster_overlap_prev"].fillna(3.0)
+        df[f"{side}_map_elo"] = df[f"{side}_map_elo"].fillna(1500.0)
 
     # Fark (diff) kolonları -> modelin doğrudan "kim daha iyi" sinyalini görmesi için
     diff_pairs = [
@@ -420,6 +531,7 @@ def attach_map_features(maps: pd.DataFrame, match_features: pd.DataFrame, team_m
         ("map_win_rate", "map_win_rate"), ("team_adr_form", "team_adr_form"),
         ("team_kast_form", "team_kast_form"), ("team_kddiff_form", "team_kddiff_form"),
         ("elo", "elo"), ("rest_days", "rest_days"), ("streak", "streak"),
+        ("roster_overlap_prev", "roster_overlap_prev"), ("map_elo", "map_elo"),
     ]
     for base, _ in diff_pairs:
         df[f"diff_{base}"] = df[f"team1_{base}"] - df[f"team2_{base}"]
@@ -448,14 +560,18 @@ def run(cfg: FeatureConfig) -> pd.DataFrame:
     logger.info("Team-map long format inşa ediliyor (Map Advantage)...")
     team_map_long = build_team_map_match_agg(maps)
     team_map_long = add_map_advantage(team_map_long)
+    team_map_long = add_map_elo(team_map_long)
 
     logger.info("Oyuncu performans geçmişi inşa ediliyor (Player Firepower)...")
     player_match = build_player_match_agg(maps)
     player_match = add_player_rolling_form(player_match, cfg.player_form_window)
     team_fp = aggregate_team_firepower(player_match)
 
+    logger.info("Kadro istikrarı (roster stability) hesaplanıyor...")
+    roster_stability = add_roster_stability(maps)
+
     logger.info("Maç-seviyesi feature tablosu birleştiriliyor...")
-    match_features = assemble_match_level_features(matches, team_long, team_map_long, team_fp, cfg)
+    match_features = assemble_match_level_features(matches, team_long, team_map_long, team_fp, roster_stability, cfg)
 
     logger.info("Feature'lar harita-seviyesi tabloya yayılıyor...")
     final_df = attach_map_features(maps, match_features, team_map_long, cfg)

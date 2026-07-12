@@ -37,13 +37,16 @@ from src.pipeline import (
     add_elo_ratings,
     add_h2h,
     add_map_advantage,
+    add_map_elo,
     add_player_rolling_form,
     add_rest_days,
+    add_roster_stability,
     add_streak,
     add_team_form,
     build_player_match_agg,
     build_team_map_match_agg,
     build_team_match_long,
+    compute_current_map_elo,
     compute_current_team_state,
 )
 
@@ -109,6 +112,8 @@ class Predictor:
         self.team_long = add_streak(self.team_long)
         self.current_state = compute_current_team_state(self.team_long).set_index("team_name")
         self.team_map_long = add_map_advantage(build_team_map_match_agg(maps))
+        self.team_map_long = add_map_elo(self.team_map_long)
+        self.current_map_elo = compute_current_map_elo(self.team_map_long).set_index(["team_name", "map_name"])
 
         player_match = build_player_match_agg(maps)
         self.player_match = add_player_rolling_form(player_match, self.cfg.player_form_window)
@@ -116,6 +121,7 @@ class Predictor:
         # Her takımın en güncel kadrosunu tahmin etmek için: o takımın SON oynadığı
         # maçtaki oyuncu id'lerini referans alıyoruz.
         self.latest_roster = self._build_latest_roster(maps)
+        self.current_roster_overlap = self._build_current_roster_overlap(maps)
 
         self.known_teams = set(self.team_long["team_name"].unique())
         self.known_maps = set(self.team_map_long["map_name"].unique())
@@ -124,15 +130,58 @@ class Predictor:
 
     @staticmethod
     def _build_latest_roster(maps: pd.DataFrame) -> dict:
-        roster = {}
+        """DİKKAT: aynı sebeple (bkz. _build_current_roster_overlap) önce iki
+        perspektifi birleştirip datetime'a göre sıralamak gerekir."""
+        frames = []
         for side in ("team1", "team2"):
             player_cols = [f"{side}_player{p}_id" for p in range(1, 6)]
             sub = maps[["datetime", side] + player_cols].rename(columns={side: "team_name"})
-            sub = sub.sort_values("datetime")
-            for team_name, group in sub.groupby("team_name"):
-                last_row = group.iloc[-1]
-                roster[team_name] = [int(pid) for pid in last_row[player_cols].dropna().tolist()]
+            sub.columns = ["datetime", "team_name"] + [f"p{p}" for p in range(1, 6)]
+            frames.append(sub)
+        combined = pd.concat(frames, ignore_index=True).sort_values("datetime")
+
+        roster = {}
+        player_cols = [f"p{p}" for p in range(1, 6)]
+        for team_name, group in combined.groupby("team_name"):
+            last_row = group.iloc[-1]
+            roster[team_name] = [int(pid) for pid in last_row[player_cols].dropna().tolist()]
         return roster
+
+    @staticmethod
+    def _build_current_roster_overlap(maps: pd.DataFrame) -> dict:
+        """Her takım için, EN SON iki maçındaki kadrolar arasındaki örtüşmeyi (0-5)
+        hesaplar -- 'şu an kadro ne kadar yeni/oturmuş' sinyali. Henüz oynanmamış
+        bir maç için bu, elimizdeki en iyi proxy: takımın son geçişi ne kadar
+        istikrarlıydı.
+
+        DİKKAT: bir takım kimi maçta 'team1', kimi maçta 'team2' tarafında olabilir --
+        bu yüzden ÖNCE iki perspektifi BİRLEŞTİRİP datetime'a göre sıralamak gerekir,
+        yoksa takımın sadece bir taraftaki maçları görülür ve sıralama yanlış çıkar.
+        """
+        frames = []
+        for side in ("team1", "team2"):
+            player_cols = [f"{side}_player{p}_id" for p in range(1, 6)]
+            sub = maps[["datetime", side] + player_cols].rename(columns={side: "team_name"})
+            sub.columns = ["datetime", "team_name"] + [f"p{p}" for p in range(1, 6)]
+            frames.append(sub)
+        combined = pd.concat(frames, ignore_index=True).sort_values("datetime")
+
+        overlap = {}
+        player_cols = [f"p{p}" for p in range(1, 6)]
+        for team_name, group in combined.groupby("team_name"):
+            rosters = [frozenset(r.dropna().tolist()) for _, r in group[player_cols].iterrows()]
+            # aynı maçın tekrar eden satırlarını (birden fazla harita) ayıklamak için
+            # sadece BİRBİRİNDEN FARKLI ardışık roster'ları tut
+            unique_seq = []
+            for r in rosters:
+                if not unique_seq or unique_seq[-1] != r:
+                    unique_seq.append(r)
+            if len(unique_seq) >= 2:
+                overlap[team_name] = len(unique_seq[-1] & unique_seq[-2])
+        return overlap
+
+    def _roster_stability_snapshot(self, team_name: str) -> float:
+        return float(self.current_roster_overlap.get(team_name, 3.0))  # bkz. pipeline.py fillna değeriyle tutarlı
 
     # ----------------------------------------------------------------- #
     # Snapshot fonksiyonları -- "bugün itibarıyla bu takımın durumu ne?"
@@ -161,9 +210,12 @@ class Predictor:
         rows = self.team_map_long[
             (self.team_map_long["team_name"] == team_name) & (self.team_map_long["map_name"] == map_name)
         ]
+        key = (team_name, map_name)
+        map_elo = float(self.current_map_elo.loc[key, "current_map_elo"]) if key in self.current_map_elo.index else ELO_INITIAL_FALLBACK
+
         if rows.empty:
-            return {"map_win_rate": self.cfg.global_prior_win_rate, "map_experience": 0.0}
-        return {"map_win_rate": rows["map_win"].mean(), "map_experience": float(len(rows))}
+            return {"map_win_rate": self.cfg.global_prior_win_rate, "map_experience": 0.0, "map_elo": map_elo}
+        return {"map_win_rate": rows["map_win"].mean(), "map_experience": float(len(rows)), "map_elo": map_elo}
 
     def _firepower_snapshot(self, team_name: str) -> dict:
         player_ids = self.latest_roster.get(team_name, [])
@@ -217,6 +269,8 @@ class Predictor:
         t2_fp = self._firepower_snapshot(team2)
         t1_state = self._current_state_snapshot(team1)
         t2_state = self._current_state_snapshot(team2)
+        t1_roster_overlap = self._roster_stability_snapshot(team1)
+        t2_roster_overlap = self._roster_stability_snapshot(team2)
 
         row = {
             "team1_form_last5": t1_form["form_last5"], "team1_form_last10": t1_form["form_last10"],
@@ -226,6 +280,7 @@ class Predictor:
             "team1_h2h_win_rate": h2h["h2h_win_rate"], "team1_h2h_matches_played": h2h["h2h_matches_played"],
             "team1_map_win_rate": t1_map["map_win_rate"], "team1_map_experience": t1_map["map_experience"],
             "team2_map_win_rate": t2_map["map_win_rate"], "team2_map_experience": t2_map["map_experience"],
+            "team1_map_elo": t1_map["map_elo"], "team2_map_elo": t2_map["map_elo"],
             "team1_team_adr_form": t1_fp["team_adr_form"], "team1_team_kast_form": t1_fp["team_kast_form"],
             "team1_team_kddiff_form": t1_fp["team_kddiff_form"],
             "team2_team_adr_form": t2_fp["team_adr_form"], "team2_team_kast_form": t2_fp["team_kast_form"],
@@ -236,6 +291,7 @@ class Predictor:
             "diff_form_last10": t1_form["form_last10"] - t2_form["form_last10"],
             "diff_form_career": t1_form["form_career"] - t2_form["form_career"],
             "diff_map_win_rate": t1_map["map_win_rate"] - t2_map["map_win_rate"],
+            "diff_map_elo": t1_map["map_elo"] - t2_map["map_elo"],
             "diff_h2h_win_rate": h2h["h2h_win_rate"] - 0.5,
             "diff_team_adr_form": t1_fp["team_adr_form"] - t2_fp["team_adr_form"],
             "diff_team_kast_form": t1_fp["team_kast_form"] - t2_fp["team_kast_form"],
@@ -246,6 +302,8 @@ class Predictor:
             "diff_elo": t1_state["elo"] - t2_state["elo"],
             "diff_rest_days": t1_state["rest_days"] - t2_state["rest_days"],
             "diff_streak": t1_state["streak"] - t2_state["streak"],
+            "team1_roster_overlap_prev": t1_roster_overlap, "team2_roster_overlap_prev": t2_roster_overlap,
+            "diff_roster_overlap_prev": t1_roster_overlap - t2_roster_overlap,
             "map_name": map_name, "tier": tier, "bestOf": str(best_of),
         }
 

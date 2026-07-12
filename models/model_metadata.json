@@ -1,5 +1,5 @@
 {
-  "champion_model_name": "Logistic Regression (baseline)",
+  "champion_model_name": "CatBoost",
   "calibration_strategy": "sigmoid",
   "feature_cols": [
     "team1_form_last5",
@@ -12,8 +12,10 @@
     "team1_h2h_matches_played",
     "team1_map_win_rate",
     "team1_map_experience",
+    "team1_map_elo",
     "team2_map_win_rate",
     "team2_map_experience",
+    "team2_map_elo",
     "team1_team_adr_form",
     "team1_team_kast_form",
     "team1_team_kddiff_form",
@@ -28,10 +30,13 @@
     "team2_rest_days",
     "team1_streak",
     "team2_streak",
+    "team1_roster_overlap_prev",
+    "team2_roster_overlap_prev",
     "diff_form_last5",
     "diff_form_last10",
     "diff_form_career",
     "diff_map_win_rate",
+    "diff_map_elo",
     "diff_h2h_win_rate",
     "diff_team_adr_form",
     "diff_team_kast_form",
@@ -39,6 +44,7 @@
     "diff_elo",
     "diff_rest_days",
     "diff_streak",
+    "diff_roster_overlap_prev",
     "map_name",
     "tier",
     "bestOf"
@@ -54,8 +60,10 @@
     "team1_h2h_matches_played",
     "team1_map_win_rate",
     "team1_map_experience",
+    "team1_map_elo",
     "team2_map_win_rate",
     "team2_map_experience",
+    "team2_map_elo",
     "team1_team_adr_form",
     "team1_team_kast_form",
     "team1_team_kddiff_form",
@@ -70,17 +78,21 @@
     "team2_rest_days",
     "team1_streak",
     "team2_streak",
+    "team1_roster_overlap_prev",
+    "team2_roster_overlap_prev",
     "diff_form_last5",
     "diff_form_last10",
     "diff_form_career",
     "diff_map_win_rate",
+    "diff_map_elo",
     "diff_h2h_win_rate",
     "diff_team_adr_form",
     "diff_team_kast_form",
     "diff_team_kddiff_form",
     "diff_elo",
     "diff_rest_days",
-    "diff_streak"
+    "diff_streak",
+    "diff_roster_overlap_prev"
   ],
   "categorical_features": [
     "map_name",
@@ -97,10 +109,10 @@
     "2026-06-28 20:00:00"
   ],
   "test_metrics_calibrated": {
-    "model": "Logistic Regression (baseline) (final)",
-    "roc_auc": 0.645940784554646,
-    "log_loss": 0.6563708183876554,
-    "brier_score": 0.23207585917672052,
-    "accuracy_at_0.5": 0.6123595505617978
+    "model": "CatBoost (final)",
+    "roc_auc": 0.6531383297059865,
+    "log_loss": 0.6514885101177488,
+    "brier_score": 0.2298667714464339,
+    "accuracy_at_0.5": 0.616729088639201
   }
 }

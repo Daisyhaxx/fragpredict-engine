@@ -28,6 +28,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import catboost as cb
 import joblib
 import lightgbm as lgb
 import matplotlib
@@ -72,17 +73,18 @@ class TrainConfig:
         "team1_form_last5", "team1_form_last10", "team1_form_career",
         "team2_form_last5", "team2_form_last10", "team2_form_career",
         "team1_h2h_win_rate", "team1_h2h_matches_played",
-        "team1_map_win_rate", "team1_map_experience",
-        "team2_map_win_rate", "team2_map_experience",
+        "team1_map_win_rate", "team1_map_experience", "team1_map_elo",
+        "team2_map_win_rate", "team2_map_experience", "team2_map_elo",
         "team1_team_adr_form", "team1_team_kast_form", "team1_team_kddiff_form",
         "team2_team_adr_form", "team2_team_kast_form", "team2_team_kddiff_form",
         "team1_roster_avg_experience", "team2_roster_avg_experience",
         "team1_elo", "team2_elo", "team1_rest_days", "team2_rest_days",
         "team1_streak", "team2_streak",
+        "team1_roster_overlap_prev", "team2_roster_overlap_prev",
         "diff_form_last5", "diff_form_last10", "diff_form_career",
-        "diff_map_win_rate", "diff_h2h_win_rate",
+        "diff_map_win_rate", "diff_map_elo", "diff_h2h_win_rate",
         "diff_team_adr_form", "diff_team_kast_form", "diff_team_kddiff_form",
-        "diff_elo", "diff_rest_days", "diff_streak",
+        "diff_elo", "diff_rest_days", "diff_streak", "diff_roster_overlap_prev",
     )
     categorical_features: tuple = ("map_name", "tier", "bestOf")
 
@@ -221,6 +223,27 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cat_cols) -> lgb.LGBMClassifi
         callbacks=[lgb.early_stopping(30, verbose=False)],
     )
     logger.info("LightGBM eğitildi -> best_iteration: %s", model.best_iteration_)
+    return model
+
+
+def train_catboost(X_train, y_train, X_val, y_val, cat_cols) -> cb.CatBoostClassifier:
+    """CatBoost, XGBoost/LightGBM'den farklı olarak kategori kolonlarını (map_name,
+    tier, bestOf) 'category' dtype'a çevirmeye gerek duymadan, cat_features listesiyle
+    doğrudan işleyebiliyor -- kendi içinde farklı bir kategori kodlama stratejisi
+    (ordered target statistics) kullanıyor."""
+    model = cb.CatBoostClassifier(
+        iterations=500,
+        depth=4,
+        learning_rate=0.03,
+        l2_leaf_reg=3.0,
+        cat_features=[c for c in cat_cols if c in X_train.columns],
+        eval_metric="Logloss",
+        random_state=42,
+        early_stopping_rounds=30,
+        verbose=False,
+    )
+    model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
+    logger.info("CatBoost eğitildi -> best_iteration: %s", model.get_best_iteration())
     return model
 
 
@@ -378,18 +401,30 @@ def run(cfg: TrainConfig) -> None:
     lgb_proba = lgb_model.predict_proba(X_test)[:, 1]
     results.append(evaluate("LightGBM", y_test, lgb_proba))
 
+    # ---- CatBoost ----
+    catboost_model = train_catboost(X_train, y_train, X_val, y_val, list(cfg.categorical_features))
+    catboost_proba = catboost_model.predict_proba(X_test)[:, 1]
+    results.append(evaluate("CatBoost", y_test, catboost_proba))
+
     results_df = pd.DataFrame(results).set_index("model")
     logger.info("\n--- Model karşılaştırma tablosu (test seti) ---\n%s", results_df.round(4).to_string())
 
     # ---- En iyi modeli seç (log_loss'a göre) ----
-    best_name = results_df["log_loss"].idxmin()
-    candidate_models = {
-        "XGBoost (varsayılan)": xgb_model, "LightGBM": lgb_model,
-    }
+    # ÖNEMLİ: Logistic Regression sadece bir SAĞLAMA/kıyas noktası olarak eğitildi
+    # (farklı bir preprocessing -- StandardScaler + numeric-only -- kullanıyor ve
+    # predict.py'nin kategorik-kolon-uyumlu akışıyla ÇALIŞMIYOR). Bu yüzden şampiyon
+    # seçimi SADECE candidate_models içindeki (predict.py ile uyumlu) modeller
+    # arasından yapılmalı -- aksi halde model ismi ile gerçekte kullanılan model
+    # birbirinden sapar (yaşanmış bir bug: isim 'Logistic Regression' derken
+    # kullanılan model sessizce XGBoost'a düşüyordu).
+    candidate_models = {"XGBoost (varsayılan)": xgb_model, "LightGBM": lgb_model, "CatBoost": catboost_model}
     if xgb_tuned_model is not None:
         candidate_models["XGBoost (Optuna-tuned)"] = xgb_tuned_model
-    best_raw_model = candidate_models.get(best_name, xgb_model)
-    logger.info("Kazanan model: %s", best_name)
+
+    deployable_results = results_df.loc[results_df.index.isin(candidate_models.keys())]
+    best_name = deployable_results["log_loss"].idxmin()
+    best_raw_model = candidate_models[best_name]
+    logger.info("Kazanan model (dağıtılabilir adaylar arasından): %s", best_name)
 
     # ---- Kalibrasyon (seçim validation'da yapılır, test setine dokunulmaz) ----
     logger.info("--- Kalibrasyon stratejisi seçiliyor (isotonic vs sigmoid vs ham) ---")
