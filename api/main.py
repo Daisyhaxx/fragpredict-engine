@@ -131,6 +131,7 @@ class TeamsResponse(BaseModel):
 class MapsResponse(BaseModel):
     count: int
     maps: list[str]
+    as_of: str  # aktif havuzun hesaplandığı tarih (verideki son maç)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,9 +183,11 @@ def list_teams():
 
 @app.get("/api/v1/maps", response_model=MapsResponse)
 def list_maps():
+    """Sadece AKTİF harita havuzunu döner (son 60 günde oynanan haritalar, bkz.
+    src/predict.py compute_active_map_pool). Havuzdan çıkan haritalar listelenmez."""
     predictor: Predictor = state["predictor"]
-    maps = sorted(predictor.known_maps)
-    return MapsResponse(count=len(maps), maps=maps)
+    maps = sorted(predictor.active_maps)
+    return MapsResponse(count=len(maps), maps=maps, as_of=str(predictor.map_pool_as_of.date()))
 
 
 @app.post("/api/v1/predict", response_model=PredictResponse)
@@ -206,6 +209,9 @@ def predict_match(request: PredictRequest):
             tier=request.tier,
             best_of=request.best_of,
         )
+    except ValueError as exc:
+        # Kullanıcı kaynaklı hata (ör. havuz dışı harita) -> 400
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Tahmin üretilirken hata oluştu.")
         raise HTTPException(status_code=500, detail=f"Tahmin üretilemedi: {exc}") from exc

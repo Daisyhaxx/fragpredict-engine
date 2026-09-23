@@ -70,6 +70,8 @@ class CleaningConfig:
     teams_file: str = "teams.csv"
     players_file: str = "players.csv"
     tournaments_file: str = "tournaments.csv"
+    # ingest_new.py'nin ürettiği Kaggle sonrası maçlar (varsa otomatik eklenir, tier kolonu dahil)
+    new_games_file: str = "cs2_new_games.csv"
 
     min_valid_date: str = "2018-01-01"
 
@@ -102,6 +104,26 @@ def load_all_sources(cfg: CleaningConfig) -> dict[str, pd.DataFrame]:
     }
     for tier_name, fname in cfg.tier_files.items():
         data[tier_name] = load_csv(cfg.raw_dir / fname)
+
+    new_path = cfg.raw_dir / cfg.new_games_file
+    if new_path.exists():
+        new_games = pd.read_csv(new_path, low_memory=False)
+        overlap = set(new_games["match_id"]) & set(data["games"]["match_id"])
+        if overlap:
+            logger.error("%s ile Kaggle verisi arasında %d ortak match_id var -- ingest_new.py'yi kontrol et.",
+                         new_path.name, len(overlap))
+            sys.exit(1)
+        unknown_tiers = set(new_games["tier"].dropna()) - set(cfg.tier_files)
+        if unknown_tiers or new_games["tier"].isna().any():
+            logger.error("%s içinde geçersiz/eksik tier var: %s", new_path.name, unknown_tiers or "NaN")
+            sys.exit(1)
+        # Tier etiketi match_id listeleri üzerinden verildiği için yeni maçları kendi tier listelerine ekliyoruz
+        for tier_name, grp in new_games.groupby("tier"):
+            data[tier_name] = pd.concat([data[tier_name], grp[["match_id"]]], ignore_index=True)
+        data["games"] = pd.concat([data["games"], new_games.drop(columns=["tier"])], ignore_index=True)
+        logger.info("Kaggle sonrası yeni veri eklendi: %d harita, %d maç (%s) | tier dağılımı: %s",
+                    len(new_games), new_games["match_id"].nunique(), new_path.name,
+                    new_games.drop_duplicates("match_id")["tier"].value_counts().to_dict())
 
     logger.info("games: %d satır, %d kolon", *data["games"].shape)
     logger.info("teams: %d satır | players: %d satır | tournaments: %d satır",
@@ -145,7 +167,7 @@ def build_map_level_table(games: pd.DataFrame, cfg: CleaningConfig) -> pd.DataFr
     df = df.dropna(subset=["map_name", "score1_game", "score2_game"])
     logger.info("Eksik map_name/skor nedeniyle %d satır atıldı.", before - len(df))
 
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    df["datetime"] = pd.to_datetime(df["datetime"], format="mixed", errors="coerce")
     before = len(df)
     df = df[df["datetime"].notna() & (df["datetime"] >= cfg.min_valid_date)]
     logger.info("Geçersiz/çok eski tarih nedeniyle %d satır atıldı.", before - len(df))
@@ -204,7 +226,7 @@ def build_match_summary_table(games: pd.DataFrame) -> pd.DataFrame:
         .groupby("match_id", as_index=False)[const_cols[1:]]
         .first()
     )
-    summary["datetime"] = pd.to_datetime(summary["datetime"], errors="coerce")
+    summary["datetime"] = pd.to_datetime(summary["datetime"], format="mixed", errors="coerce")
     summary = summary.dropna(subset=["datetime", "score1_match", "score2_match"])
     summary["team1_match_win"] = (summary["score1_match"] > summary["score2_match"]).astype(int)
     summary = summary.sort_values("datetime").reset_index(drop=True)

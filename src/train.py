@@ -68,6 +68,7 @@ class TrainConfig:
     tune_hyperparams: bool = True
     optuna_n_trials: int = 40
     optuna_n_splits: int = 4
+    final_fit: bool = True  # değerlendirme sonrası dağıtılacak modeli tüm veriyle yeniden eğit
 
     numeric_features: tuple = (
         "team1_form_last5", "team1_form_last10", "team1_form_career",
@@ -85,6 +86,12 @@ class TrainConfig:
         "diff_map_win_rate", "diff_map_elo", "diff_h2h_win_rate",
         "diff_team_adr_form", "diff_team_kast_form", "diff_team_kddiff_form",
         "diff_elo", "diff_rest_days", "diff_streak", "diff_roster_overlap_prev",
+        # NOT: is_major/is_qualifier ve interaction feature'ları (diff_elo_x_tier1 vb.)
+        # pipeline.py'de hesaplanıyor ve parquet'te MEVCUT, ama CatBoost şampiyon
+        # modelde test edildiğinde performansı hafifçe KÖTÜLEŞTİRDİĞİ için (ROC-AUC
+        # 0.6531 -> 0.6517) bilinçli olarak burada KULLANILMIYOR. XGBoost'ta izole
+        # test hafif bir iyileşme göstermişti, ama asıl şampiyon model CatBoost
+        # olduğu için nihai karar CatBoost'un test sonucuna göre verildi.
     )
     categorical_features: tuple = ("map_name", "tier", "bestOf")
 
@@ -126,11 +133,22 @@ def chronological_split(df: pd.DataFrame, cfg: TrainConfig):
     return train_df, val_df, test_df
 
 
-def get_xy(df: pd.DataFrame, cfg: TrainConfig, feature_cols: list):
+def build_category_levels(df: pd.DataFrame, cfg: TrainConfig) -> dict[str, list[str]]:
+    """Kategorik kolonların (map_name, tier, bestOf) TÜM veri setindeki değer listesi.
+
+    Neden: her split kendi içinde astype('category') yapılırsa, sadece test döneminde
+    görülen bir değer (ör. 2026'da havuza giren Cache) eğitimde hiç tanımlanmamış olur
+    ve XGBoost 'Found a category not in the training set' hatası verir. Ortak liste
+    sadece değer İSİMLERİNİ içerir, etiket bilgisi taşımaz -- leakage değildir. Modelin
+    o harita hakkında eğitimden öğrendiği bir şey yine olmaz (soğuk başlangıç)."""
+    return {c: sorted(df[c].astype(str).unique()) for c in cfg.categorical_features if c in df.columns}
+
+
+def get_xy(df: pd.DataFrame, cfg: TrainConfig, feature_cols: list, category_levels: dict):
     X = df[feature_cols].copy()
-    for c in cfg.categorical_features:
+    for c, levels in category_levels.items():
         if c in X.columns:
-            X[c] = X[c].astype("category")
+            X[c] = pd.Categorical(X[c].astype(str), categories=levels)
     y = df[cfg.target_col].astype(int)
     return X, y
 
@@ -173,7 +191,10 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
             fold_losses.append(log_loss(y_va, proba))
         return float(np.mean(fold_losses))
 
-    study = optuna.create_study(direction="minimize", study_name="xgboost_cs2")
+    # Sabit seed: aynı veriyle her çalıştırma aynı ayarları bulsun (yoksa sonuçlar
+    # çalıştırmadan çalıştırmaya ±0.005 AUC oynuyor ve gerçek iyileşmeyle karışıyor)
+    study = optuna.create_study(direction="minimize", study_name="xgboost_cs2",
+                                sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     logger.info("Optuna tamamlandı -> %d deneme, en iyi ortalama fold LogLoss: %.4f",
@@ -276,6 +297,50 @@ def evaluate(name: str, y_true, y_proba) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Final fit: seçilen modeli TÜM veriye yeniden eğitmek
+# --------------------------------------------------------------------------- #
+def refit_on_all_data(model, X_all: pd.DataFrame, y_all: pd.Series, cat_cols: list):
+    """Değerlendirmede seçilen modeli AYNI hiperparametrelerle tüm veriye (train+val+test)
+    yeniden eğitir.
+
+    Neden: değerlendirme modeli, test ve validation dönemlerini (son ~1 yıl) hiç
+    görmüyor. Ölçüm için doğru olan bu; ama canlı tahminde en güncel dinamikleri
+    (kadrolar, harita havuzu) öğrenmemiş bir model kullanmak demek. Değerlendirme
+    bir kere yapıldıktan sonra, dağıtılacak model tüm veriyle eğitilir.
+
+    Early stopping için ayrılacak veri kalmadığından ağaç sayısı, değerlendirme
+    çalışmasında early stopping'in bulduğu en iyi iterasyona sabitlenir.
+    """
+    if isinstance(model, xgb.XGBClassifier):
+        params = model.get_params()
+        params.pop("early_stopping_rounds", None)
+        best_it = getattr(model, "best_iteration", None)
+        if best_it is not None:
+            params["n_estimators"] = best_it + 1
+        final = xgb.XGBClassifier(**params)
+        final.fit(X_all, y_all, verbose=False)
+        n_trees = params["n_estimators"]
+    elif isinstance(model, lgb.LGBMClassifier):
+        params = model.get_params()
+        params["n_estimators"] = getattr(model, "best_iteration_", None) or params["n_estimators"]
+        final = lgb.LGBMClassifier(**params)
+        final.fit(X_all, y_all, categorical_feature=[c for c in cat_cols if c in X_all.columns])
+        n_trees = params["n_estimators"]
+    elif isinstance(model, cb.CatBoostClassifier):
+        params = model.get_params()
+        params.pop("early_stopping_rounds", None)
+        params["iterations"] = model.get_best_iteration() + 1
+        final = cb.CatBoostClassifier(**params)
+        final.fit(X_all, y_all, verbose=False)
+        n_trees = params["iterations"]
+    else:
+        raise TypeError(f"Final fit desteklenmeyen model tipi: {type(model).__name__}")
+
+    logger.info("Final fit tamamlandı -> %s, %d satır, %d ağaç", type(model).__name__, len(X_all), n_trees)
+    return final, n_trees
+
+
+# --------------------------------------------------------------------------- #
 # Kalibrasyon
 # --------------------------------------------------------------------------- #
 def calibrate_model(model, method: str, X_val, y_val):
@@ -367,9 +432,10 @@ def run(cfg: TrainConfig) -> None:
 
     feature_cols = [c for c in cfg.numeric_features if c in df.columns] + list(cfg.categorical_features)
 
-    X_train, y_train = get_xy(train_df, cfg, feature_cols)
-    X_val, y_val = get_xy(val_df, cfg, feature_cols)
-    X_test, y_test = get_xy(test_df, cfg, feature_cols)
+    category_levels = build_category_levels(df, cfg)
+    X_train, y_train = get_xy(train_df, cfg, feature_cols, category_levels)
+    X_val, y_val = get_xy(val_df, cfg, feature_cols, category_levels)
+    X_test, y_test = get_xy(test_df, cfg, feature_cols, category_levels)
 
     logger.info("Sınıf dengesi -> train: %.3f | val: %.3f | test: %.3f",
                 y_train.mean(), y_val.mean(), y_test.mean())
@@ -439,19 +505,49 @@ def run(cfg: TrainConfig) -> None:
     # ---- Kayıt ----
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
-    joblib.dump(calibrated_model, cfg.output_dir / "champion_model.pkl")
+    # Değerlendirilen (sadece train ile eğitilmiş) modeller -- tekrar üretilebilirlik için saklanıyor
+    joblib.dump(calibrated_model, cfg.output_dir / "champion_model_eval.pkl")
     joblib.dump(best_raw_model, cfg.output_dir / "champion_model_raw.pkl")
+
+    test_metrics = evaluate(f"{best_name} (final)", y_test, calibrated_proba)
+    calib_gain = log_loss(y_test, raw_best_proba) - test_metrics["log_loss"]
+
+    # ---- Final fit: dağıtılacak model TÜM veriyle eğitilir ----
+    if cfg.final_fit:
+        logger.info("--- Final fit: %s, aynı ayarlarla TÜM veriye yeniden eğitiliyor ---", best_name)
+        X_all = pd.concat([X_train, X_val, X_test])
+        y_all = pd.concat([y_train, y_val, y_test])
+        deployed_model, n_trees = refit_on_all_data(best_raw_model, X_all, y_all, list(cfg.categorical_features))
+        # Tüm veri kullanıldığı için kalibrasyonu öğrenecek ayrı bir dönem kalmıyor; model
+        # kalibrasyonsuz dağıtılıyor. Değerlendirmede kalibrasyonun katkısı ölçülüp
+        # metadata'ya yazılıyor -- belirgin çıkarsa bu karar yeniden düşünülmeli.
+        if calib_gain > 0.005:
+            logger.warning("Kalibrasyon testte LogLoss'u %.4f iyileştirmişti; final model kalibrasyonsuz. "
+                           "Bu fark büyük, yakından bak.", calib_gain)
+        deployed_desc = f"final fit (tüm veri, {len(X_all)} satır, {n_trees} ağaç, kalibrasyonsuz)"
+        final_range = [str(df["datetime"].min()), str(df["datetime"].max())]
+    else:
+        deployed_model = calibrated_model
+        deployed_desc = "değerlendirme modeli (sadece train, kalibre)"
+        final_range = [str(train_df["datetime"].min()), str(train_df["datetime"].max())]
+
+    joblib.dump(deployed_model, cfg.output_dir / "champion_model.pkl")
+    logger.info("Dağıtılan model (champion_model.pkl): %s", deployed_desc)
 
     metadata = {
         "champion_model_name": best_name,
+        "deployed_model": deployed_desc,
+        "deployed_train_date_range": final_range,
         "calibration_strategy": calib_strategy,
+        "calibration_logloss_gain_on_test": round(float(calib_gain), 4),
         "feature_cols": feature_cols,
         "numeric_features": numeric_cols,
         "categorical_features": list(cfg.categorical_features),
+        "category_levels": category_levels,
         "target_col": cfg.target_col,
-        "train_date_range": [str(train_df["datetime"].min()), str(train_df["datetime"].max())],
+        "eval_train_date_range": [str(train_df["datetime"].min()), str(train_df["datetime"].max())],
         "test_date_range": [str(test_df["datetime"].min()), str(test_df["datetime"].max())],
-        "test_metrics_calibrated": evaluate(f"{best_name} (final)", y_test, calibrated_proba),
+        "test_metrics_calibrated": test_metrics,
     }
     with open(cfg.output_dir / "model_metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -469,12 +565,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CS2 harita-kazanan tahmin modeli eğitimi.")
     parser.add_argument("--features-path", type=Path, default=Path("data/processed/features_engineered.parquet"))
     parser.add_argument("--output-dir", type=Path, default=Path("models"))
+    parser.add_argument("--no-final-fit", action="store_true",
+                        help="Dağıtılacak modeli tüm veriyle yeniden eğitme (sadece değerlendirme modeli kaydedilir)")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg = TrainConfig(features_path=args.features_path, output_dir=args.output_dir)
+    cfg = TrainConfig(features_path=args.features_path, output_dir=args.output_dir, final_fit=not args.no_final_fit)
     run(cfg)
 
 

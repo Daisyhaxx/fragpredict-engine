@@ -65,6 +65,29 @@ class PredictConfig:
     global_prior_win_rate: float = 0.5
     player_form_window: int = 5
     form_windows: tuple = (5, 10)
+    # Aktif harita havuzu: verideki SON maç tarihinden geriye bu kadar gün içinde
+    # en az active_pool_min_plays kez oynanmış haritalar.
+    active_pool_window_days: int = 60
+    active_pool_min_plays: int = 3
+
+
+def compute_active_map_pool(maps: pd.DataFrame, window_days: int, min_plays: int) -> tuple[set, pd.Timestamp]:
+    """Aktif harita havuzunu veriden çıkarır.
+
+    CS2'de harita havuzu yılda birkaç kez değişiyor (ör. Cache'in havuza girmesi). Listeyi
+    elle tutmak yerine: son `window_days` gün içinde en az `min_plays` kez oynanmış haritalar
+    aktif sayılır. Havuzdan çıkan harita oynanmadığı için kendiliğinden düşer, yeni gelen
+    kendiliğinden eklenir.
+
+    Referans tarih BUGÜN değil verideki son maç -- veri birkaç hafta eskiyse havuz boş
+    kalmasın diye. min_plays, pencerede tek seferlik görünen bir haritanın havuza
+    girmesini engeller.
+    """
+    dt = pd.to_datetime(maps["datetime"])
+    as_of = dt.max()
+    recent = maps.loc[dt >= as_of - pd.Timedelta(days=window_days), "map_name"]
+    counts = recent.value_counts()
+    return set(counts[counts >= min_plays].index), as_of
 
 
 class Predictor:
@@ -95,8 +118,9 @@ class Predictor:
 
         self.feature_cols = self.metadata["feature_cols"]
         self.categorical_features = self.metadata["categorical_features"]
-        logger.info("Model: %s | Kalibrasyon: %s", self.metadata["champion_model_name"],
-                    self.metadata.get("calibration_strategy", "raw"))
+        logger.info("Model: %s | %s", self.metadata["champion_model_name"],
+                    self.metadata.get("deployed_model",
+                                      f"kalibrasyon: {self.metadata.get('calibration_strategy', 'raw')}"))
 
     # ----------------------------------------------------------------- #
     def _load_and_build_snapshots(self) -> None:
@@ -127,6 +151,18 @@ class Predictor:
         self.known_maps = set(self.team_map_long["map_name"].unique())
         logger.info("%d benzersiz takım, %d benzersiz harita geçmişte bulundu.",
                     len(self.known_teams), len(self.known_maps))
+
+        self.active_maps, self.map_pool_as_of = compute_active_map_pool(
+            maps, self.cfg.active_pool_window_days, self.cfg.active_pool_min_plays)
+        if not self.active_maps:
+            logger.warning("Son %d günde yeterince oynanan harita yok -> aktif havuz yerine tüm haritalar kullanılacak.",
+                           self.cfg.active_pool_window_days)
+            self.active_maps = set(self.known_maps)
+        logger.info("Aktif harita havuzu (%s itibarıyla, son %d gün): %s", self.map_pool_as_of.date(),
+                    self.cfg.active_pool_window_days, sorted(self.active_maps))
+        inactive = sorted(self.known_maps - self.active_maps)
+        if inactive:
+            logger.info("Havuz dışı (geçmişte var, artık oynanmıyor): %s", inactive)
 
     @staticmethod
     def _build_latest_roster(maps: pd.DataFrame) -> dict:
@@ -308,8 +344,12 @@ class Predictor:
         }
 
         df = pd.DataFrame([row])[self.feature_cols]
+        levels = self.metadata.get("category_levels", {})
         for c in self.categorical_features:
-            df[c] = df[c].astype("category")
+            if c in levels:  # eğitimdekiyle aynı kategori listesi (train.py build_category_levels)
+                df[c] = pd.Categorical(df[c].astype(str), categories=levels[c])
+            else:            # eski metadata (category_levels yok)
+                df[c] = df[c].astype("category")
         return df
 
     # ----------------------------------------------------------------- #
@@ -317,8 +357,10 @@ class Predictor:
         for name, label in ((team1, "team1"), (team2, "team2")):
             if name not in self.known_teams:
                 logger.warning("'%s' (%s) geçmiş veride yok -> soğuk başlangıç (lig ortalaması) varsayımıyla tahmin edilecek.", name, label)
-        if map_name not in self.known_maps:
-            logger.warning("'%s' haritası geçmiş veride yok -> map advantage için lig ortalaması kullanılacak.", map_name)
+        if map_name not in self.active_maps:
+            raise ValueError(
+                f"'{map_name}' aktif harita havuzunda değil. Aktif haritalar: {', '.join(sorted(self.active_maps))}"
+            )
 
         X = self._build_feature_row(team1, team2, map_name, tier, best_of)
         proba_team1 = float(self.model.predict_proba(X)[:, 1][0])
@@ -355,7 +397,11 @@ def main() -> None:
     args = parse_args()
     cfg = PredictConfig(processed_dir=args.processed_dir, models_dir=args.models_dir)
     predictor = Predictor(cfg)
-    result = predictor.predict(args.team1, args.team2, args.map_name, args.tier, args.bestof)
+    try:
+        result = predictor.predict(args.team1, args.team2, args.map_name, args.tier, args.bestof)
+    except ValueError as exc:
+        print(f"\nHATA: {exc}\n")
+        return
 
     print("\n" + "=" * 50)
     print(f"  {result['team1']}  vs  {result['team2']}   ({result['map']})")
