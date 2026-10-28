@@ -16,9 +16,11 @@ VERİ SETİ HAKKINDA KRİTİK NOTLAR (EDA sırasında keşfedildi):
            oyuncu stat'ı yok). Eğitim için KULLANILAMAZ, filtrelenir.
 
     3. `team1_win` kolonu maç bazlı DEĞİL, harita bazlıdır (Bo3/Bo5 maçlarda satırdan
-       satıra değişir). Ancak ~%1-2 oranında score1_game/score2_game ile tutarsızdır
-       (scraping kaynaklı anomali). Bu yüzden nihai hedef değişkeni ham kolondan değil,
-       skorlardan yeniden türetiyoruz: team1_map_win = score1_game > score2_game.
+       satıra değişir). Ancak score1_game/score2_game ile tutarsız olabiliyor: 2026Q2'den
+       itibaren haritaların ~%18'inde bu kolon harita yerine SERİ kazananını gösteriyor
+       (toplamda ~%4; harita skorları ise seri skorlarıyla tutarlı). Bu yüzden nihai hedef
+       değişkeni ham kolondan değil, skorlardan yeniden türetiyoruz:
+       team1_map_win = score1_game > score2_game.
 
     4. *** ÖNEMLİ DÜZELTME (ilk EDA'da yanlış varsayılmıştı) ***
        team_id bu veri setinde İSTİKRARLI bir takım kimliği DEĞİLDİR — aynı takım
@@ -70,8 +72,6 @@ class CleaningConfig:
     teams_file: str = "teams.csv"
     players_file: str = "players.csv"
     tournaments_file: str = "tournaments.csv"
-    # ingest_new.py'nin ürettiği Kaggle sonrası maçlar (varsa otomatik eklenir, tier kolonu dahil)
-    new_games_file: str = "cs2_new_games.csv"
 
     min_valid_date: str = "2018-01-01"
 
@@ -104,26 +104,6 @@ def load_all_sources(cfg: CleaningConfig) -> dict[str, pd.DataFrame]:
     }
     for tier_name, fname in cfg.tier_files.items():
         data[tier_name] = load_csv(cfg.raw_dir / fname)
-
-    new_path = cfg.raw_dir / cfg.new_games_file
-    if new_path.exists():
-        new_games = pd.read_csv(new_path, low_memory=False)
-        overlap = set(new_games["match_id"]) & set(data["games"]["match_id"])
-        if overlap:
-            logger.error("%s ile Kaggle verisi arasında %d ortak match_id var -- ingest_new.py'yi kontrol et.",
-                         new_path.name, len(overlap))
-            sys.exit(1)
-        unknown_tiers = set(new_games["tier"].dropna()) - set(cfg.tier_files)
-        if unknown_tiers or new_games["tier"].isna().any():
-            logger.error("%s içinde geçersiz/eksik tier var: %s", new_path.name, unknown_tiers or "NaN")
-            sys.exit(1)
-        # Tier etiketi match_id listeleri üzerinden verildiği için yeni maçları kendi tier listelerine ekliyoruz
-        for tier_name, grp in new_games.groupby("tier"):
-            data[tier_name] = pd.concat([data[tier_name], grp[["match_id"]]], ignore_index=True)
-        data["games"] = pd.concat([data["games"], new_games.drop(columns=["tier"])], ignore_index=True)
-        logger.info("Kaggle sonrası yeni veri eklendi: %d harita, %d maç (%s) | tier dağılımı: %s",
-                    len(new_games), new_games["match_id"].nunique(), new_path.name,
-                    new_games.drop_duplicates("match_id")["tier"].value_counts().to_dict())
 
     logger.info("games: %d satır, %d kolon", *data["games"].shape)
     logger.info("teams: %d satır | players: %d satır | tournaments: %d satır",

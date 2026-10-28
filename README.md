@@ -38,25 +38,24 @@ api/main.py            → FastAPI service, /api/v1/predict, Supabase logging
 ## Results
 
 The current champion model (CatBoost, sigmoid-calibrated) evaluated on a **strictly
-chronological, held-out test period** (Jan–Jun 2026, unseen during training):
+chronological, held-out test period** (May–Oct 2026, unseen during training):
 
 | Metric | Value |
 |---|---|
-| ROC-AUC | 0.653 |
-| Log Loss | 0.651 |
-| Brier Score | 0.230 |
-| Accuracy @ 0.5 | 61.7% |
+| ROC-AUC | 0.647 |
+| Log Loss | 0.659 |
+| Brier Score | 0.233 |
+| Accuracy @ 0.5 | 60.6% |
 
-For context: professional esports betting markets typically operate in the 0.60–0.68
-ROC-AUC range for this kind of prediction — CS2 is a high-variance game and near-perfect
-prediction is not a realistic target. See [Limitations & Lessons Learned](#limitations--lessons-learned)
+For context: CS2 is a high-variance game and near-perfect prediction is not a realistic
+target. See [Limitations & Lessons Learned](#limitations--lessons-learned)
 below for an honest discussion of what this model can and cannot do.
 
 ## Data
 
-Source: HLTV professional match history (tier 1–3), covering **5,134 matches /
-10,675 played maps** across **392 teams** and **1,398 players**, from
-**Oct 25, 2023 to Jun 28, 2026**.
+Source: HLTV professional match history (tier 1–3), covering **5,903 matches /
+12,235 played maps** across **483 teams** and **1,566 players**, from
+**Oct 25, 2023 to Oct 24, 2026**.
 
 Raw CSVs are not committed to this repo (see `.gitignore`) — place them under
 `data/raw/` before running the pipeline:

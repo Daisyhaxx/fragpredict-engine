@@ -38,25 +38,24 @@ api/main.py             → FastAPI servisi, /api/v1/predict, Supabase loglama
 ## Sonuçlar
 
 Mevcut şampiyon model (CatBoost, sigmoid ile kalibre edilmiş), **kesinlikle
-kronolojik, hiç görülmemiş bir test döneminde** (Ocak–Haziran 2026) değerlendirildi:
+kronolojik, hiç görülmemiş bir test döneminde** (Mayıs–Ekim 2026) değerlendirildi:
 
 | Metrik | Değer |
 |---|---|
-| ROC-AUC | 0.653 |
-| Log Loss | 0.651 |
-| Brier Score | 0.230 |
-| Doğruluk (@0.5) | %61.7 |
+| ROC-AUC | 0.647 |
+| Log Loss | 0.659 |
+| Brier Score | 0.233 |
+| Doğruluk (@0.5) | %60.6 |
 
-Bağlam için: profesyonel e-spor bahis piyasaları bu tip tahminlerde genelde
-0.60–0.68 ROC-AUC aralığında dolaşıyor — CS2 yüksek varyanslı bir oyun ve
-neredeyse-mükemmel tahmin gerçekçi bir hedef değil. Bu modelin neleri yapıp
+Bağlam için: CS2 yüksek varyanslı bir oyun ve neredeyse-mükemmel tahmin
+gerçekçi bir hedef değil. Bu modelin neleri yapıp
 neleri yapamadığına dair dürüst bir tartışma için aşağıdaki
 [Sınırlamalar ve Çıkarılan Dersler](#sınırlamalar-ve-çıkarılan-dersler) bölümüne bakın.
 
 ## Veri
 
-Kaynak: HLTV profesyonel maç geçmişi (tier 1-3), **5.134 maç / 10.675 oynanan
-harita**, **392 takım** ve **1.398 oyuncu**, **25 Ekim 2023 – 28 Haziran 2026**
+Kaynak: HLTV profesyonel maç geçmişi (tier 1-3), **5.903 maç / 12.235 oynanan
+harita**, **483 takım** ve **1.566 oyuncu**, **25 Ekim 2023 – 24 Ekim 2026**
 aralığında.
 
 Ham CSV'ler bu repoya commitlenmemiştir (bkz. `.gitignore`) — pipeline'ı
