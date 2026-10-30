@@ -14,6 +14,9 @@ Sorumluluklar:
 
 Ortam değişkenleri (.env dosyasından okunur, bkz. .env.example):
     SUPABASE_URL, SUPABASE_KEY
+    SUPABASE_KEY, publishable (sb_publishable_) anahtar olmalı: 'predictions' tablosunda
+    sadece INSERT'e izin veren RLS kuralıyla (bkz. deploy/supabase/predictions_rls.sql)
+    anahtar sızsa bile tek yapılabilecek şey satır eklemek olur.
 
 Çalıştırma:
     uvicorn api.main:app --reload --port 8000
@@ -23,7 +26,11 @@ Ortam değişkenleri (.env dosyasından okunur, bkz. .env.example):
 from __future__ import annotations
 
 import logging
+import math
 import os
+import threading
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -148,13 +155,60 @@ class ModelInfoResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Loglama kapısı: herkese açık API'de spam tabloyu doldurmasın / kirletmesin
+# --------------------------------------------------------------------------- #
+class LogGate:
+    """Supabase'e yazmadan önce iki kontrol -- IP'ye bakılmaz, hiçbir şey kalıcı tutulmaz:
+        - tekrar: aynı maç (takım sırası fark etmez) + harita, dedup_seconds içinde
+          ikinci kez yazılmaz (ör. ⇄ ile sırayı çevirip yeniden sormak)
+        - bütçe: dakikada / UTC gününde en fazla N satır; spam olsa bile tablonun
+          büyümesi sınırlı kalır
+    Neden IP başına sınır değil: Space bir proxy arkasında, istemci IP'si sadece
+    X-Forwarded-For'dan okunabiliyor ve o başlığı istemci sahte doldurabilir.
+    Kapı kapalıyken tahmin yine döner, sadece kayıt atlanır."""
+
+    def __init__(self, per_minute: int, per_day: int, dedup_seconds: float):
+        self.per_minute, self.per_day, self.dedup_seconds = per_minute, per_day, dedup_seconds
+        self._lock = threading.Lock()  # sync endpoint'ler thread havuzunda, eşzamanlı çalışır
+        self._recent_writes: deque[float] = deque()  # son 60 sn'deki yazma zamanları
+        self._day, self._day_count = None, 0
+        self._last_written: dict[tuple, float] = {}
+
+    def allow(self, result: dict) -> bool:
+        key = (*sorted((result["team1"], result["team2"])), result["map"])
+        now = time.monotonic()
+        today = datetime.now(timezone.utc).date()
+        with self._lock:
+            if now - self._last_written.get(key, -math.inf) < self.dedup_seconds:
+                return False
+            while self._recent_writes and now - self._recent_writes[0] >= 60:
+                self._recent_writes.popleft()
+            if today != self._day:
+                self._day, self._day_count = today, 0
+            if len(self._recent_writes) >= self.per_minute or self._day_count >= self.per_day:
+                return False
+
+            self._recent_writes.append(now)
+            self._day_count += 1
+            self._last_written[key] = now
+            if len(self._last_written) > 10_000:  # bellek sınırı: süresi dolanları at
+                self._last_written = {k: t for k, t in self._last_written.items()
+                                      if now - t < self.dedup_seconds}
+            return True
+
+
+log_gate = LogGate(per_minute=30, per_day=3000, dedup_seconds=600)
+
+
+# --------------------------------------------------------------------------- #
 # Yardımcı: Supabase'e loglama (asla ana akışı bozmamalı)
 # --------------------------------------------------------------------------- #
 def _log_prediction_to_supabase(result: dict) -> bool:
     supabase = state.get("supabase")
-    if supabase is None:
+    if supabase is None or not log_gate.allow(result):
         return False
     try:
+        from postgrest.types import ReturnMethod
         row = {
             "created_at": datetime.now(timezone.utc).isoformat(),
             "team1": result["team1"],
@@ -167,7 +221,9 @@ def _log_prediction_to_supabase(result: dict) -> bool:
             "predicted_winner": result["predicted_winner"],
             "model_name": result["model"],
         }
-        supabase.table("predictions").insert(row).execute()
+        # minimal: anahtarın okuma izni yok (sadece INSERT); varsayılan 'representation'
+        # eklenen satırı geri okumaya çalışır ve RLS'e takılır.
+        supabase.table("predictions").insert(row, returning=ReturnMethod.minimal).execute()
         return True
     except Exception:
         logger.exception("Tahmin Supabase'e loglanamadı -> tahmin sonucu yine de döndürülüyor.")

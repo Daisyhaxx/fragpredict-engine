@@ -14,8 +14,8 @@ Give it two teams and a map — say, Team Vitality vs Natus Vincere on Mirage �
 returns a calibrated win probability for each side. The model is a logistic regression
 (it matched or beat XGBoost, LightGBM and CatBoost on a held-out validation period)
 trained on about 2.5 years of professional match history, served through a
-FastAPI endpoint, with every prediction logged to a Postgres database (Supabase) so
-they can be reviewed later.
+FastAPI endpoint, with predictions logged to a Postgres database (Supabase) so they
+can be reviewed later.
 
 ```
 raw CSVs (HLTV match history)
@@ -186,8 +186,21 @@ hf upload <user>/fragpredict . . --repo-type space \
 hf upload <user>/fragpredict deploy/huggingface/README.md README.md --repo-type space
 ```
 
-Don't set `SUPABASE_URL` / `SUPABASE_KEY` in the Space unless you want every public
-request logged. After retraining, rerun the first `hf upload` to redeploy.
+Prediction logging is optional. To turn it on, first run
+`deploy/supabase/predictions_rls.sql` in the Supabase SQL Editor. It gives the
+publishable key (`sb_publishable_…`) insert-only access to the `predictions` table: no
+reads, updates or deletes. Then add `SUPABASE_URL` and `SUPABASE_KEY` (the publishable
+key) as **Secrets** in the Space settings. Don't use Variables, because those are
+public. Even if the key leaked, all it could do is insert rows, which the public API
+already does.
+
+Two safeguards in the API protect the table, and neither uses IP addresses:
+- **Write budget:** at most 30 rows a minute and 3,000 a day.
+- **Duplicate check:** the same match and map, in either team order, isn't logged again
+  within 10 minutes.
+
+When a write is skipped, the prediction is still returned; only the log entry is
+dropped. After retraining, rerun the first `hf upload` to redeploy.
 
 ## Limitations & lessons learned
 
@@ -252,10 +265,15 @@ Worth being upfront about what this model can't do, not just what it can.
 
 ## Data source
 
-The dataset is [Counter-Strike Pro Matches on Kaggle](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches),
-originally compiled from HLTV.org professional match history. Not redistributed in
-this repository — download it from Kaggle and place the CSVs under `data/raw/` as
-described above.
+The dataset is [Counter-Strike Pro Matches on Kaggle](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches)
+by ektarr, originally compiled from HLTV.org professional match history and licensed
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It isn't
+redistributed in this repository. Download it from Kaggle and place the CSVs under
+`data/raw/` as described above.
+
+The Hugging Face Space ships two processed files derived from it (`maps_clean.parquet`
+and `matches_summary.parquet`: cleaned and restructured per match and map). Under the
+ShareAlike term, those files are licensed CC BY-SA 4.0 as well.
 
 ## License
 

@@ -14,7 +14,7 @@ sunumu için ayrı ayrı aşamalar.
 her iki taraf için kalibre edilmiş bir galibiyet olasılığı dönsün. Model, ~2.5
 yıllık profesyonel maç geçmişiyle eğitilmiş bir logistic regression (ayrı tutulan bir
 validation döneminde XGBoost, LightGBM ve CatBoost'a denk ya da onlardan iyi çıktı),
-bir FastAPI endpoint'i üzerinden sunuluyor, her tahmin de daha sonra incelenebilsin
+bir FastAPI endpoint'i üzerinden sunuluyor, tahminler de daha sonra incelenebilsin
 diye bir Postgres veritabanına (Supabase) kaydediliyor.
 
 ```
@@ -188,9 +188,21 @@ hf upload <kullanici>/fragpredict . . --repo-type space \
 hf upload <kullanici>/fragpredict deploy/huggingface/README.md README.md --repo-type space
 ```
 
-Herkese açık her isteğin loglanmasını istemiyorsan Space'te `SUPABASE_URL` /
-`SUPABASE_KEY` tanımlama. Yeniden eğitimden sonra ilk `hf upload` komutunu tekrar
-çalıştırman yeterli.
+Tahmin kaydı isteğe bağlı. Açmak için önce Supabase SQL Editor'de
+`deploy/supabase/predictions_rls.sql` dosyasını çalıştır. Bu dosya publishable
+anahtara (`sb_publishable_…`) `predictions` tablosunda yalnızca satır ekleme izni
+verir; okuma, güncelleme ve silme izni yoktur. Sonra Space ayarlarında `SUPABASE_URL`
+ve `SUPABASE_KEY` (publishable anahtar) değerlerini **Secret** olarak ekle. Variable
+olarak ekleme, çünkü Variable'lar herkese açıktır. Anahtar sızsa bile yapılabilecek tek
+şey satır eklemek olur; bunu herkese açık API zaten yapıyor.
+
+API'de tabloyu koruyan iki önlem var, ikisi de IP adresi kullanmıyor:
+- **Yazma bütçesi:** Dakikada en fazla 30, günde en fazla 3.000 satır.
+- **Tekrar kontrolü:** Aynı maç ve harita, takım sırası ne olursa olsun, 10 dakika
+  içinde tekrar kaydedilmez.
+
+Bir kayıt atlandığında tahmin yine döner, yalnızca o kayıt yazılmaz. Yeniden
+eğitimden sonra ilk `hf upload` komutunu tekrar çalıştırman yeterli.
 
 ## Sınırlamalar ve Çıkarılan Dersler
 
@@ -260,10 +272,16 @@ Modelin ne yapamadığını da açıkça söylemekte fayda var, sadece ne yaptı
 
 ## Veri Kaynağı
 
-Veri seti [Kaggle'daki Counter-Strike Pro Matches](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches) —
-aslen HLTV.org profesyonel maç geçmişinden derlenmiş. Bu repoda yeniden
-dağıtılmamaktadır — Kaggle'dan indirip CSV'leri yukarıda anlatıldığı gibi
-`data/raw/` altına yerleştir.
+Veri seti, ektarr'ın [Kaggle'daki Counter-Strike Pro Matches](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches)
+veri seti. Aslen HLTV.org profesyonel maç geçmişinden derlenmiş ve
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) lisanslı. Bu repoda
+yeniden dağıtılmıyor; Kaggle'dan indirip CSV'leri yukarıda anlatıldığı gibi `data/raw/`
+altına yerleştir.
+
+Hugging Face Space'te bu veriden türetilmiş iki işlenmiş dosya var: `maps_clean.parquet`
+ve `matches_summary.parquet` (temizlenmiş, maç ve harita düzeyinde yeniden
+düzenlenmiş). Lisansın "aynı lisansla paylaş" şartı gereği bu dosyalar da CC BY-SA 4.0
+ile paylaşılıyor.
 
 ## Lisans
 
