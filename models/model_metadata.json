@@ -1,12 +1,14 @@
 {
-  "champion_model_name": "XGBoost (varsayılan)",
-  "deployed_model": "final fit (tüm veri, 12235 harita + aynaları = 24470 satır, 154 ağaç, kalibrasyonsuz)",
+  "champion_model_name": "Logistic Regression",
+  "champion_selection": "validation log_loss (test seti seçimde kullanılmadı)",
+  "seed": 42,
+  "deployed_model": "final fit (tüm veri, 12235 harita + aynaları = 24470 satır, doğrusal model, kalibrasyonsuz)",
   "deployed_train_date_range": [
     "2023-10-25 18:00:00",
     "2026-10-24 19:20:00"
   ],
   "calibration_strategy": "sigmoid",
-  "calibration_logloss_gain_on_test": 0.0006,
+  "calibration_logloss_gain_on_test": 0.0007,
   "feature_cols": [
     "team1_form_last5",
     "team1_form_last10",
@@ -136,15 +138,85 @@
     "2023-10-25 18:00:00",
     "2025-11-07 13:10:00"
   ],
+  "val_date_range": [
+    "2025-11-07 13:10:00",
+    "2026-05-28 18:00:00"
+  ],
   "test_date_range": [
     "2026-05-28 20:00:00",
     "2026-10-24 19:20:00"
   ],
   "test_metrics_calibrated": {
-    "model": "XGBoost (varsayılan) (final)",
-    "roc_auc": 0.6451419124842224,
-    "log_loss": 0.6576480214283353,
-    "brier_score": 0.232796212247238,
-    "accuracy_at_0.5": 0.6072984749455338
+    "model": "Logistic Regression (final)",
+    "roc_auc": 0.6488218754879304,
+    "log_loss": 0.6581881800140036,
+    "brier_score": 0.2327281755345696,
+    "accuracy_at_0.5": 0.6023965141612201
+  },
+  "candidate_metrics": {
+    "validation": {
+      "Logistic Regression": {
+        "roc_auc": 0.6505,
+        "log_loss": 0.6484,
+        "brier_score": 0.2288,
+        "accuracy_at_0.5": 0.6158
+      },
+      "XGBoost (varsayılan)": {
+        "roc_auc": 0.6491,
+        "log_loss": 0.6513,
+        "brier_score": 0.2298,
+        "accuracy_at_0.5": 0.6196
+      },
+      "XGBoost (Optuna-tuned)": {
+        "roc_auc": 0.6476,
+        "log_loss": 0.6522,
+        "brier_score": 0.2302,
+        "accuracy_at_0.5": 0.6191
+      },
+      "LightGBM": {
+        "roc_auc": 0.6477,
+        "log_loss": 0.6516,
+        "brier_score": 0.23,
+        "accuracy_at_0.5": 0.6218
+      },
+      "CatBoost": {
+        "roc_auc": 0.6498,
+        "log_loss": 0.6502,
+        "brier_score": 0.2293,
+        "accuracy_at_0.5": 0.618
+      }
+    },
+    "test": {
+      "Logistic Regression": {
+        "roc_auc": 0.6488,
+        "log_loss": 0.6589,
+        "brier_score": 0.2329,
+        "accuracy_at_0.5": 0.6024
+      },
+      "XGBoost (varsayılan)": {
+        "roc_auc": 0.6451,
+        "log_loss": 0.6583,
+        "brier_score": 0.2331,
+        "accuracy_at_0.5": 0.6073
+      },
+      "XGBoost (Optuna-tuned)": {
+        "roc_auc": 0.6441,
+        "log_loss": 0.66,
+        "brier_score": 0.2338,
+        "accuracy_at_0.5": 0.6084
+      },
+      "LightGBM": {
+        "roc_auc": 0.6447,
+        "log_loss": 0.659,
+        "brier_score": 0.2334,
+        "accuracy_at_0.5": 0.6051
+      },
+      "CatBoost": {
+        "roc_auc": 0.6392,
+        "log_loss": 0.6608,
+        "brier_score": 0.2342,
+        "accuracy_at_0.5": 0.6062
+      }
+    }
   }
 }

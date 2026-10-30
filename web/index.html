@@ -30,7 +30,7 @@
 
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
   .teams { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: end; }
-  .row { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; margin-top: 16px; }
+  .row { margin-top: 16px; }
   label { display: flex; flex-direction: column; gap: 6px; font-size: 0.85rem; color: var(--muted); }
   input, select {
     width: 100%;
@@ -81,8 +81,6 @@
   @media (max-width: 560px) {
     .teams { grid-template-columns: 1fr; }
     #swap { justify-self: center; transform: rotate(90deg); }
-    .row { grid-template-columns: 1fr 1fr; }
-    .row label:first-child { grid-column: 1 / -1; }
   }
 </style>
 </head>
@@ -106,20 +104,6 @@
     <div class="row">
       <label>Harita
         <select id="map" required></select>
-      </label>
-      <label>Seviye
-        <select id="tier">
-          <option value="tier1">Tier 1</option>
-          <option value="tier2">Tier 2</option>
-          <option value="tier3">Tier 3</option>
-        </select>
-      </label>
-      <label>Seri
-        <select id="bestof">
-          <option value="1">BO1</option>
-          <option value="3" selected>BO3</option>
-          <option value="5">BO5</option>
-        </select>
       </label>
     </div>
     <p class="hint" id="pool-hint"></p>
@@ -223,7 +207,7 @@
     $("summary").textContent = top < 0.55
       ? "Başa baş: model iki takımı neredeyse eşit görüyor."
       : `Favori: ${r.predicted_winner}`;
-    $("context").textContent = `${r.map} · ${r.tier.replace("tier", "Tier ")} · BO${r.best_of}`;
+    $("context").textContent = r.map;
     $("result").hidden = false;
   }
 
@@ -252,9 +236,9 @@
         body: JSON.stringify({
           team1,
           team2,
+          // tier/best_of gönderilmiyor: şampiyon model (Logistic Regression) bunları
+          // kullanmıyor, tahmini değiştirmiyorlar -- API varsayılanları geçerli.
           map: $("map").value,
-          tier: $("tier").value,
-          best_of: Number($("bestof").value),
         }),
       });
       renderResult(result);

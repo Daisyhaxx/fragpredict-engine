@@ -7,8 +7,9 @@ tahmin modelini eğitir.
 Adımlar:
     1. KRONOLOJİK split (asla rastgele split değil — geçmişle geleceği eğit/test
        arasında karıştırmak, zaman serisi verisinde en klasik leakage kaynağıdır)
-    2. XGBoost ve LightGBM'i aynı split üzerinde karşılaştırır (+ Logistic Regression
-       baseline, "modelim gerçekten bir şey öğreniyor mu" sağlaması için)
+    2. Logistic Regression, XGBoost, LightGBM ve CatBoost'u aynı split üzerinde
+       karşılaştırır. Şampiyon VALIDATION log-loss'una göre seçilir; test seti sadece
+       seçimden sonra rapor için kullanılır.
     3. Kazanan modeli isotonic regression ile KALİBRE eder (ham ağaç modeli olasılıkları
        genelde aşırı-güvenli/az-güvenli olur; API'de "win probability" göstereceğimiz
        için kalibrasyon şart)
@@ -44,12 +45,15 @@ import xgboost as xgb
 
 matplotlib.use("Agg")  # PyCharm/headless ortamda güvenli backend
 import matplotlib.pyplot as plt
+from sklearn.base import clone
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import FunctionTransformer, StandardScaler
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from src.symmetry import augment_with_mirror, order_asymmetry, symmetric_proba
 
@@ -77,6 +81,7 @@ class TrainConfig:
     optuna_n_trials: int = 40
     optuna_n_splits: int = 4
     final_fit: bool = True  # değerlendirme sonrası dağıtılacak modeli tüm veriyle yeniden eğit
+    seed: int = 42  # tüm modellerin ve Optuna'nın seed'i -- seçimin şansa duyarlılığını ölçmek için değiştirilebilir
 
     numeric_features: tuple = (
         "team1_form_last5", "team1_form_last10", "team1_form_career",
@@ -164,7 +169,8 @@ def get_xy(df: pd.DataFrame, cfg: TrainConfig, feature_cols: list, category_leve
 # --------------------------------------------------------------------------- #
 # Hiperparametre optimizasyonu (Optuna, ZAMAN-SERİSİ uyumlu CV)
 # --------------------------------------------------------------------------- #
-def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int, n_splits: int) -> dict:
+def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int, n_splits: int,
+                        seed: int = 42) -> dict:
     """XGBoost hiperparametrelerini Optuna ile arar.
 
     KRİTİK: sklearn'ün varsayılan KFold'u RASTGELE böler -- zaman serisi verisinde bu,
@@ -196,7 +202,7 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
             X_va, y_va = X_train.iloc[fold_val_idx], y_train.iloc[fold_val_idx]
             model = xgb.XGBClassifier(
                 **params, eval_metric="logloss", enable_categorical=True,
-                tree_method="hist", random_state=42,
+                tree_method="hist", random_state=seed,
             )
             model.fit(X_tr, y_tr)
             proba = symmetric_proba(model, X_va)
@@ -206,7 +212,7 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
     # Sabit seed: aynı veriyle her çalıştırma aynı ayarları bulsun (yoksa sonuçlar
     # çalıştırmadan çalıştırmaya ±0.005 AUC oynuyor ve gerçek iyileşmeyle karışıyor)
     study = optuna.create_study(direction="minimize", study_name="xgboost_cs2",
-                                sampler=optuna.samplers.TPESampler(seed=42))
+                                sampler=optuna.samplers.TPESampler(seed=seed))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
     logger.info("Optuna tamamlandı -> %d deneme, en iyi ortalama fold LogLoss: %.4f",
@@ -218,7 +224,7 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
 # --------------------------------------------------------------------------- #
 # Model eğitimi
 # --------------------------------------------------------------------------- #
-def train_xgboost(X_train, y_train, X_val, y_val, params: dict | None = None) -> xgb.XGBClassifier:
+def train_xgboost(X_train, y_train, X_val, y_val, params: dict | None = None, seed: int = 42) -> xgb.XGBClassifier:
     default_params = dict(
         n_estimators=500, max_depth=4, learning_rate=0.03,
         subsample=0.8, colsample_bytree=0.8, reg_lambda=1.0,
@@ -230,14 +236,14 @@ def train_xgboost(X_train, y_train, X_val, y_val, params: dict | None = None) ->
         enable_categorical=True,
         tree_method="hist",
         early_stopping_rounds=30,
-        random_state=42,
+        random_state=seed,
     )
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     logger.info("XGBoost eğitildi -> best_iteration: %s", model.best_iteration)
     return model
 
 
-def train_lightgbm(X_train, y_train, X_val, y_val, cat_cols) -> lgb.LGBMClassifier:
+def train_lightgbm(X_train, y_train, X_val, y_val, cat_cols, seed: int = 42) -> lgb.LGBMClassifier:
     model = lgb.LGBMClassifier(
         n_estimators=500,
         max_depth=4,
@@ -245,7 +251,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cat_cols) -> lgb.LGBMClassifi
         subsample=0.8,
         colsample_bytree=0.8,
         reg_lambda=1.0,
-        random_state=42,
+        random_state=seed,
         verbosity=-1,
     )
     model.fit(
@@ -259,7 +265,7 @@ def train_lightgbm(X_train, y_train, X_val, y_val, cat_cols) -> lgb.LGBMClassifi
     return model
 
 
-def train_catboost(X_train, y_train, X_val, y_val, cat_cols) -> cb.CatBoostClassifier:
+def train_catboost(X_train, y_train, X_val, y_val, cat_cols, seed: int = 42) -> cb.CatBoostClassifier:
     """CatBoost, XGBoost/LightGBM'den farklı olarak kategori kolonlarını (map_name,
     tier, bestOf) 'category' dtype'a çevirmeye gerek duymadan, cat_features listesiyle
     doğrudan işleyebiliyor -- kendi içinde farklı bir kategori kodlama stratejisi
@@ -271,7 +277,7 @@ def train_catboost(X_train, y_train, X_val, y_val, cat_cols) -> cb.CatBoostClass
         l2_leaf_reg=3.0,
         cat_features=[c for c in cat_cols if c in X_train.columns],
         eval_metric="Logloss",
-        random_state=42,
+        random_state=seed,
         early_stopping_rounds=30,
         verbose=False,
     )
@@ -280,13 +286,19 @@ def train_catboost(X_train, y_train, X_val, y_val, cat_cols) -> cb.CatBoostClass
     return model
 
 
-def train_logistic_baseline(X_train, y_train, numeric_cols):
-    """Sadece numerik feature'larla basit bir baseline -> ağaç modellerinin gerçekten
-    ekstra sinyal yakalayıp yakalamadığını anlamak için sağlama (sanity check).
-    Tek bir pipeline olarak döner ki symmetric_proba diğer modellerle aynı şekilde
-    (ham feature tablosu üzerinden) çağırabilsin."""
+def train_logistic_regression(X_train, y_train, numeric_cols) -> Pipeline:
+    """Sadece numerik feature'larla doğrusal model. Hem ağaç modellerinin gerçekten
+    ekstra sinyal yakalayıp yakalamadığının sağlaması, hem de tam bir şampiyon adayı.
+
+    Tek bir pipeline olarak döner ki symmetric_proba ve predict.py diğer modellerle aynı
+    şekilde (ham feature tablosu üzerinden) çağırabilsin. Sadece sklearn bileşenleri
+    kullanılıyor: özel bir fonksiyon (ör. lambda) pickle edilemez ya da yüklenirken
+    train.py'yi -- ve eğitim bağımlılıklarını -- servis imajına import ettirirdi."""
     model = make_pipeline(
-        FunctionTransformer(lambda X: X[numeric_cols].fillna(0.5)),
+        ColumnTransformer(
+            [("num", SimpleImputer(strategy="constant", fill_value=0.5), list(numeric_cols))],
+            remainder="drop", verbose_feature_names_out=False,
+        ),
         StandardScaler(),
         LogisticRegression(max_iter=1000),
     )
@@ -312,6 +324,14 @@ def evaluate(name: str, y_true, y_proba) -> dict:
     return metrics
 
 
+def compare_models(models: dict, X, y, split_name: str) -> pd.DataFrame:
+    """Modelleri tek bir bölümde, servisle aynı symmetric_proba ile ölçüp tabloyu loglar."""
+    table = pd.DataFrame([evaluate(name, y, symmetric_proba(m, X)) for name, m in models.items()])
+    table = table.set_index("model")
+    logger.info("\n--- Model karşılaştırma tablosu (%s) ---\n%s", split_name, table.round(4).to_string())
+    return table
+
+
 # --------------------------------------------------------------------------- #
 # Final fit: seçilen modeli TÜM veriye yeniden eğitmek
 # --------------------------------------------------------------------------- #
@@ -326,7 +346,15 @@ def refit_on_all_data(model, X_all: pd.DataFrame, y_all: pd.Series, cat_cols: li
 
     Early stopping için ayrılacak veri kalmadığından ağaç sayısı, değerlendirme
     çalışmasında early stopping'in bulduğu en iyi iterasyona sabitlenir.
+
+    Döner: (model, boyut açıklaması -- ör. "347 ağaç")
     """
+    if isinstance(model, Pipeline):
+        # Logistic Regression: early stopping yok, aynı pipeline sıfırdan eğitilir
+        final = clone(model).fit(X_all, y_all)
+        logger.info("Final fit tamamlandı -> %s, %d satır", type(model[-1]).__name__, len(X_all))
+        return final, "doğrusal model"
+
     if isinstance(model, xgb.XGBClassifier):
         params = model.get_params()
         params.pop("early_stopping_rounds", None)
@@ -353,7 +381,7 @@ def refit_on_all_data(model, X_all: pd.DataFrame, y_all: pd.Series, cat_cols: li
         raise TypeError(f"Final fit desteklenmeyen model tipi: {type(model).__name__}")
 
     logger.info("Final fit tamamlandı -> %s, %d satır, %d ağaç", type(model).__name__, len(X_all), n_trees)
-    return final, n_trees
+    return final, f"{n_trees} ağaç"
 
 
 # --------------------------------------------------------------------------- #
@@ -430,12 +458,22 @@ def plot_calibration_curve(y_true, proba_raw, proba_calibrated, output_path: Pat
 
 
 def plot_feature_importance(model, feature_names, output_path: Path, top_n: int = 20):
-    importances = model.feature_importances_
-    order = np.argsort(importances)[::-1][:top_n]
+    """Ağaç modellerinde feature_importances_, Logistic Regression'da standartlaştırılmış
+    katsayılar (işaretli: + team1 lehine). Katsayıları tek tek okurken dikkat: team1_x,
+    team2_x ve diff_x aynı bilgiyi paylaşıyor (diff = team1 - team2), bu yüzden bir
+    büyüklüğün etkisi bu üçüne bölünür -- grup olarak okunmalı."""
+    if isinstance(model, Pipeline):
+        importances = model[-1].coef_[0]
+        feature_names = list(model[:-1].get_feature_names_out())
+        xlabel = "Standartlaştırılmış katsayı (+: team1 lehine)"
+    else:
+        importances = model.feature_importances_
+        xlabel = "Önem (gain)"
+    order = np.argsort(np.abs(importances))[::-1][:top_n]
 
     fig, ax = plt.subplots(figsize=(8, 7))
     ax.barh([feature_names[i] for i in order][::-1], importances[order][::-1])
-    ax.set_xlabel("Önem (gain)")
+    ax.set_xlabel(xlabel)
     ax.set_title("Feature Importance (İlk %d)" % top_n)
     fig.tight_layout()
     fig.savefig(output_path, dpi=120)
@@ -465,58 +503,41 @@ def run(cfg: TrainConfig) -> None:
     X_train_aug, y_train_aug = augment_with_mirror(X_train, y_train)
     X_val_aug, y_val_aug = augment_with_mirror(X_val, y_val)
 
-    # ---- Baseline: Logistic Regression (sadece numerik feature'larla) ----
+    cat_cols = list(cfg.categorical_features)
+
+    # ---- Şampiyon adayları ----
+    # Model ismi ve kaydedilen model aynı sözlük girdisinden geliyor -- ikisi birbirinden
+    # sapamaz (yaşanmış bir bug: isim 'Logistic Regression' derken kullanılan model
+    # sessizce XGBoost'a düşüyordu). Her aday predict.py ile uyumlu olmalı.
     numeric_cols = [c for c in cfg.numeric_features if c in df.columns]
-    log_model = train_logistic_baseline(X_train_aug, y_train_aug, numeric_cols)
-    logreg_proba = symmetric_proba(log_model, X_test)
-    results = [evaluate("Logistic Regression (baseline)", y_test, logreg_proba)]
-
-    # ---- XGBoost (varsayılan hiperparametreler) ----
-    xgb_model = train_xgboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug)
-    xgb_proba = symmetric_proba(xgb_model, X_test)
-    results.append(evaluate("XGBoost (varsayılan)", y_test, xgb_proba))
-
-    # ---- XGBoost (Optuna ile ayarlanmış hiperparametreler) ----
+    candidate_models = {
+        # Deterministik (seed'e bağlı değil); ağaç modelleri bunu geçemiyorsa,
+        # mevcut feature'larda doğrusal olmayan ek bir sinyal yok demektir.
+        "Logistic Regression": train_logistic_regression(X_train_aug, y_train_aug, numeric_cols),
+        "XGBoost (varsayılan)": train_xgboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, seed=cfg.seed),
+    }
     if cfg.tune_hyperparams:
         logger.info("--- Optuna hiperparametre araması başlıyor (%d deneme, %d fold, zaman-serisi CV) ---",
                     cfg.optuna_n_trials, cfg.optuna_n_splits)
         # ayna satırsız veriliyor -- fold'lara bölündükten sonra içeride ekleniyor
-        best_params = tune_xgboost_optuna(X_train, y_train, cfg.optuna_n_trials, cfg.optuna_n_splits)
-        xgb_tuned_model = train_xgboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, params=best_params)
-        xgb_tuned_proba = symmetric_proba(xgb_tuned_model, X_test)
-        results.append(evaluate("XGBoost (Optuna-tuned)", y_test, xgb_tuned_proba))
-    else:
-        xgb_tuned_model = None
+        best_params = tune_xgboost_optuna(X_train, y_train, cfg.optuna_n_trials, cfg.optuna_n_splits, cfg.seed)
+        candidate_models["XGBoost (Optuna-tuned)"] = train_xgboost(
+            X_train_aug, y_train_aug, X_val_aug, y_val_aug, params=best_params, seed=cfg.seed)
+    candidate_models["LightGBM"] = train_lightgbm(X_train_aug, y_train_aug, X_val_aug, y_val_aug, cat_cols, cfg.seed)
+    candidate_models["CatBoost"] = train_catboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, cat_cols, cfg.seed)
 
-    # ---- LightGBM ----
-    lgb_model = train_lightgbm(X_train_aug, y_train_aug, X_val_aug, y_val_aug, list(cfg.categorical_features))
-    lgb_proba = symmetric_proba(lgb_model, X_test)
-    results.append(evaluate("LightGBM", y_test, lgb_proba))
-
-    # ---- CatBoost ----
-    catboost_model = train_catboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, list(cfg.categorical_features))
-    catboost_proba = symmetric_proba(catboost_model, X_test)
-    results.append(evaluate("CatBoost", y_test, catboost_proba))
-
-    results_df = pd.DataFrame(results).set_index("model")
-    logger.info("\n--- Model karşılaştırma tablosu (test seti) ---\n%s", results_df.round(4).to_string())
-
-    # ---- En iyi modeli seç (log_loss'a göre) ----
-    # ÖNEMLİ: Logistic Regression sadece bir SAĞLAMA/kıyas noktası olarak eğitildi
-    # (farklı bir preprocessing -- StandardScaler + numeric-only -- kullanıyor ve
-    # predict.py'nin kategorik-kolon-uyumlu akışıyla ÇALIŞMIYOR). Bu yüzden şampiyon
-    # seçimi SADECE candidate_models içindeki (predict.py ile uyumlu) modeller
-    # arasından yapılmalı -- aksi halde model ismi ile gerçekte kullanılan model
-    # birbirinden sapar (yaşanmış bir bug: isim 'Logistic Regression' derken
-    # kullanılan model sessizce XGBoost'a düşüyordu).
-    candidate_models = {"XGBoost (varsayılan)": xgb_model, "LightGBM": lgb_model, "CatBoost": catboost_model}
-    if xgb_tuned_model is not None:
-        candidate_models["XGBoost (Optuna-tuned)"] = xgb_tuned_model
-
-    deployable_results = results_df.loc[results_df.index.isin(candidate_models.keys())]
-    best_name = deployable_results["log_loss"].idxmin()
+    # ---- Şampiyon seçimi: VALIDATION log_loss'a göre ----
+    # Seçim test setinde yapılırsa raporlanan test metriği iyimser olur: adaylar
+    # arasından testte en iyi görüneni seçmek, o adayın test dönemindeki şansını da
+    # seçer. Test seti bu yüzden sadece seçimden SONRA, rapor için kullanılır.
+    # (Boosting modelleri early stopping için de val'i kullanıyor; bu her adayın val
+    # skorunu biraz iyimser yapar ama test setine bilgi taşımaz.)
+    val_table = compare_models(candidate_models, X_val, y_val, "VALIDATION seti -- şampiyon buna göre seçilir")
+    best_name = val_table["log_loss"].idxmin()
     best_raw_model = candidate_models[best_name]
-    logger.info("Kazanan model (dağıtılabilir adaylar arasından): %s", best_name)
+    logger.info("Kazanan model (validation log_loss): %s", best_name)
+
+    test_table = compare_models(candidate_models, X_test, y_test, "TEST seti -- sadece rapor, seçimde kullanılmadı")
 
     # ---- Kalibrasyon (seçim validation'da yapılır, test setine dokunulmaz) ----
     logger.info("--- Kalibrasyon stratejisi seçiliyor (isotonic vs sigmoid vs ham) ---")
@@ -544,7 +565,7 @@ def run(cfg: TrainConfig) -> None:
     if cfg.final_fit:
         logger.info("--- Final fit: %s, aynı ayarlarla TÜM veriye yeniden eğitiliyor ---", best_name)
         X_all, y_all = augment_with_mirror(pd.concat([X_train, X_val, X_test]), pd.concat([y_train, y_val, y_test]))
-        deployed_model, n_trees = refit_on_all_data(best_raw_model, X_all, y_all, list(cfg.categorical_features))
+        deployed_model, model_size = refit_on_all_data(best_raw_model, X_all, y_all, list(cfg.categorical_features))
         # Tüm veri kullanıldığı için kalibrasyonu öğrenecek ayrı bir dönem kalmıyor; model
         # kalibrasyonsuz dağıtılıyor. Değerlendirmede kalibrasyonun katkısı ölçülüp
         # metadata'ya yazılıyor -- belirgin çıkarsa bu karar yeniden düşünülmeli.
@@ -552,7 +573,7 @@ def run(cfg: TrainConfig) -> None:
             logger.warning("Kalibrasyon testte LogLoss'u %.4f iyileştirmişti; final model kalibrasyonsuz. "
                            "Bu fark büyük, yakından bak.", calib_gain)
         deployed_desc = (f"final fit (tüm veri, {len(df)} harita + aynaları = {len(X_all)} satır, "
-                         f"{n_trees} ağaç, kalibrasyonsuz)")
+                         f"{model_size}, kalibrasyonsuz)")
         final_range = [str(df["datetime"].min()), str(df["datetime"].max())]
     else:
         deployed_model = calibrated_model
@@ -564,6 +585,8 @@ def run(cfg: TrainConfig) -> None:
 
     metadata = {
         "champion_model_name": best_name,
+        "champion_selection": "validation log_loss (test seti seçimde kullanılmadı)",
+        "seed": cfg.seed,
         "deployed_model": deployed_desc,
         "deployed_train_date_range": final_range,
         "calibration_strategy": calib_strategy,
@@ -575,8 +598,14 @@ def run(cfg: TrainConfig) -> None:
         "target_col": cfg.target_col,
         "order_invariance": "ayna satırlarla eğitim + tahminde iki sıranın ortalaması (src/symmetry.py)",
         "eval_train_date_range": [str(train_df["datetime"].min()), str(train_df["datetime"].max())],
+        "val_date_range": [str(val_df["datetime"].min()), str(val_df["datetime"].max())],
         "test_date_range": [str(test_df["datetime"].min()), str(test_df["datetime"].max())],
         "test_metrics_calibrated": test_metrics,
+        # Ham (kalibrasyonsuz) aday metrikleri; şampiyon 'validation' tablosuna göre seçildi
+        "candidate_metrics": {
+            "validation": val_table.round(4).to_dict(orient="index"),
+            "test": test_table.round(4).to_dict(orient="index"),
+        },
     }
     with open(cfg.output_dir / "model_metadata.json", "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -584,8 +613,7 @@ def run(cfg: TrainConfig) -> None:
 
     plot_calibration_curve(y_test, raw_best_proba, calibrated_proba, cfg.output_dir / "calibration_curve.png")
 
-    if best_name in candidate_models:
-        plot_feature_importance(best_raw_model, feature_cols, cfg.output_dir / "feature_importance.png")
+    plot_feature_importance(best_raw_model, feature_cols, cfg.output_dir / "feature_importance.png")
 
     logger.info("Eğitim tamamlandı. Tüm çıktılar -> %s", cfg.output_dir)
 
@@ -596,12 +624,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("models"))
     parser.add_argument("--no-final-fit", action="store_true",
                         help="Dağıtılacak modeli tüm veriyle yeniden eğitme (sadece değerlendirme modeli kaydedilir)")
+    parser.add_argument("--seed", type=int, default=42, help="Tüm modellerin ve Optuna'nın seed'i")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg = TrainConfig(features_path=args.features_path, output_dir=args.output_dir, final_fit=not args.no_final_fit)
+    cfg = TrainConfig(features_path=args.features_path, output_dir=args.output_dir,
+                      final_fit=not args.no_final_fit, seed=args.seed)
     run(cfg)
 
 

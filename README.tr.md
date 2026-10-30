@@ -12,7 +12,8 @@ sunumu için ayrı ayrı aşamalar.
 
 İki takım ve bir harita ver — mesela Team Vitality vs Natus Vincere, Mirage'da —
 her iki taraf için kalibre edilmiş bir galibiyet olasılığı dönsün. Model, ~2.5
-yıllık profesyonel maç geçmişiyle eğitilmiş bir gradient boosting sınıflandırıcısı,
+yıllık profesyonel maç geçmişiyle eğitilmiş bir logistic regression (ayrı tutulan bir
+validation döneminde XGBoost, LightGBM ve CatBoost'a denk ya da onlardan iyi çıktı),
 bir FastAPI endpoint'i üzerinden sunuluyor, her tahmin de daha sonra incelenebilsin
 diye bir Postgres veritabanına (Supabase) kaydediliyor.
 
@@ -26,8 +27,9 @@ src/eda_cleaning.py   →  temizlik, şema doğrulama, sızıntı-güvenli hedef
 src/pipeline.py       →  sızıntısız feature engineering (Elo, form, H2H, kadro
    │                      istikrarı, oyuncu performansı, harita-özel rating'ler...)
    ▼
-src/train.py          →  kronolojik train/val/test split, XGBoost / LightGBM /
-   │                      CatBoost karşılaştırması, Optuna tuning, olasılık kalibrasyonu
+src/train.py          →  kronolojik train/val/test split, logistic regression /
+   │                      XGBoost / LightGBM / CatBoost karşılaştırması (şampiyon
+   │                      validation'da seçilir), Optuna tuning, olasılık kalibrasyonu
    ▼
 src/predict.py         → inference katmanı (train/serve tutarsızlığını önlemek için
    │                      pipeline.py'nin aynı feature fonksiyonlarını yeniden kullanır)
@@ -37,15 +39,19 @@ api/main.py             → FastAPI servisi, /api/v1/predict, Supabase loglama
 
 ## Sonuçlar
 
-Mevcut şampiyon model (XGBoost, sigmoid ile kalibre edilmiş), **kesinlikle
-kronolojik, hiç görülmemiş bir test döneminde** (Mayıs–Ekim 2026) değerlendirildi:
+Mevcut şampiyon model (logistic regression, sigmoid ile kalibre edilmiş), **kesinlikle
+kronolojik, hiç görülmemiş bir test döneminde** (Mayıs–Ekim 2026) değerlendirildi.
+Şampiyon validation döneminde seçiliyor; test dönemi seçimde hiç kullanılmadı:
 
-| Metrik | Değer |
-|---|---|
-| ROC-AUC | 0.645 |
-| Log Loss | 0.658 |
-| Brier Score | 0.233 |
-| Doğruluk (@0.5) | %60.7 |
+| Metrik | Değer | %95 GA |
+|---|---|---|
+| ROC-AUC | 0.649 | 0.624 – 0.674 |
+| Log Loss | 0.658 | 0.646 – 0.671 |
+| Brier Score | 0.233 | 0.227 – 0.239 |
+| Doğruluk (@0.5) | %60.2 | %58.0 – %62.6 |
+
+Güven aralıkları, 922 test maçı üzerinden bootstrap ile hesaplandı (aynı maçın
+haritaları birlikte örneklenir).
 
 Tahminler **takım sırasından bağımsız**: "A vs B" ile "B vs A" her zaman birbirinin
 tam tümleyeni olan olasılıklar alır (bkz. [takım sırası yanlılığı](#sınırlamalar-ve-çıkarılan-dersler)).
@@ -230,6 +236,21 @@ Modelin ne yapamadığını da açıkça söylemekte fayda var, sadece ne yaptı
   (eski model, kullanıcı sırası rastgele) 0.6576'ya iyileşti. Sırayı sabit bir
   kuralla belirlemek (alfabetik ya da yüksek Elo önde) de sıra bağımlılığını
   gideriyor ama daha isabetli çıkmadı.
+- **Modeller arası seçim gürültüydü, en basit model kazandı.** Şampiyon eskiden test
+  setindeki log loss'a göre seçilip yine aynı test setinde raporlanıyordu — hafif bir
+  seçim yanlılığı (raporlanan log loss'u ortalama 0.0008, en fazla 0.0025 iyimser
+  gösteriyordu). Artık validation döneminde seçiliyor. Karşılaştırma 10 farklı
+  seed'le tekrarlandığında gradient boosting modelleri seed'e göre yer değiştirdi
+  (validation'ı 7 çalıştırmada XGBoost, 3'ünde CatBoost kazandı) ve tüm ikili farklar
+  bootstrap güven aralığının içinde kaldı. Logistic regression 10 çalıştırmanın
+  hepsinde validation'da en iyi log loss'u verdi, deterministik ve testte en iyi ağaç
+  modeli kadar iyi; bu yüzden şampiyon o: mevcut feature'larla gradient boosting ek bir
+  doğrusal olmayan sinyal bulamıyor. Seçim kuralı modelden bağımsız kalıyor; ileride
+  eklenen feature'lar ağaç modellerine bulacak bir şey verirse onlar öne geçer.
+  Yan etki: logistic regression sadece numerik feature'ları kullanıyor, bu yüzden
+  seviye (tier) ve seri (BO) bir tahmini değiştirmiyor (sıradan bağımsızlık altında
+  bunlar ancak etkileşim üzerinden etkili olabilirdi). Harita ise haritaya özel Elo,
+  galibiyet oranı ve deneyim üzerinden etkisini koruyor.
 - **Test edildi ama benimsenmedi** (negatif sonuçlar, şeffaflık için burada
   tutuluyor): yakınlık-ağırlıklı eğitim örnekleri, daha geniş Optuna araması
   (100 deneme) ve Optuna ile ayarlanmış CatBoost — hepsi, tutulan test setinde

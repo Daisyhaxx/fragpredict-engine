@@ -11,8 +11,9 @@ through an API, instead of one long script.
 ## Overview
 
 Give it two teams and a map — say, Team Vitality vs Natus Vincere on Mirage — and it
-returns a calibrated win probability for each side. The model is a gradient-boosted
-classifier trained on about 2.5 years of professional match history, served through a
+returns a calibrated win probability for each side. The model is a logistic regression
+(it matched or beat XGBoost, LightGBM and CatBoost on a held-out validation period)
+trained on about 2.5 years of professional match history, served through a
 FastAPI endpoint, with every prediction logged to a Postgres database (Supabase) so
 they can be reviewed later.
 
@@ -26,8 +27,9 @@ src/eda_cleaning.py   →  cleaning, schema validation, leakage-aware target der
 src/pipeline.py       →  leakage-free feature engineering (Elo, form, H2H, roster
    │                      stability, player firepower, map-specific ratings...)
    ▼
-src/train.py          →  chronological train/val/test split, XGBoost / LightGBM /
-   │                      CatBoost comparison, Optuna tuning, probability calibration
+src/train.py          →  chronological train/val/test split, logistic regression /
+   │                      XGBoost / LightGBM / CatBoost comparison (champion picked on
+   │                      validation), Optuna tuning, probability calibration
    ▼
 src/predict.py         → inference layer (reuses pipeline.py's feature functions to
    │                      avoid train/serve skew)
@@ -37,15 +39,20 @@ api/main.py            → FastAPI service, /api/v1/predict, Supabase logging
 
 ## Results
 
-The current champion model (XGBoost, sigmoid-calibrated) evaluated on a **strictly
-chronological, held-out test period** (May–Oct 2026, unseen during training):
+The current champion model (logistic regression, sigmoid-calibrated) evaluated on a
+**strictly chronological, held-out test period** (May–Oct 2026, unseen during training).
+The champion is picked on the validation period, so the test period played no part in
+choosing it:
 
-| Metric | Value |
-|---|---|
-| ROC-AUC | 0.645 |
-| Log Loss | 0.658 |
-| Brier Score | 0.233 |
-| Accuracy @ 0.5 | 60.7% |
+| Metric | Value | 95% CI |
+|---|---|---|
+| ROC-AUC | 0.649 | 0.624 – 0.674 |
+| Log Loss | 0.658 | 0.646 – 0.671 |
+| Brier Score | 0.233 | 0.227 – 0.239 |
+| Accuracy @ 0.5 | 60.2% | 58.0% – 62.6% |
+
+Confidence intervals come from a bootstrap over the 922 test matches (maps of the same
+match are resampled together).
 
 Predictions are **order-invariant**: "A vs B" and "B vs A" always get exactly
 complementary probabilities (see [team order bias](#limitations--lessons-learned)).
@@ -222,6 +229,21 @@ Worth being upfront about what this model can't do, not just what it can.
   0.6614 (old model, random user order) to 0.6576. Fixing the order canonically
   instead (alphabetical, or higher Elo first) also removes the order dependence but
   wasn't more accurate.
+- **The choice between models was noise, so the simplest one won.** The champion used
+  to be picked by test-set log loss and then scored on that same test set — a mild
+  selection bias (on average it flattered the reported log loss by 0.0008, at most
+  0.0025). It's now picked on the validation period. Re-running the comparison with
+  10 seeds showed the gradient-boosted models trading places from seed to seed
+  (XGBoost won validation in 7 runs, CatBoost in 3), with every pairwise difference
+  inside its bootstrap CI. Logistic regression had the best validation log loss in
+  all 10 runs, is deterministic and is as good as the best tree model on test, so it
+  is the champion: with the current features, gradient boosting finds no extra
+  non-linear signal. The selection rule stays model-agnostic, so a tree model takes
+  over if future features give it something to find.
+  Side effect: logistic regression uses only the numeric features, so tier and
+  best-of don't change a prediction (under order invariance they could only matter
+  through interactions). The map still matters through map-specific Elo, win rate and
+  experience.
 - **Tested but not adopted** (negative results, kept for transparency): recency-weighted
   training samples, wider Optuna search (100 trials), and Optuna-tuned CatBoost all
   *underperformed* their simpler counterparts on the held-out test set — with a
