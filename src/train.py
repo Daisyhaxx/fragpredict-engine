@@ -16,6 +16,11 @@ Adımlar:
     5. Modeli + metadata'yı models/ klasörüne kaydeder (predict.py ve api/main.py
        bunları doğrudan yükleyecek)
 
+Sıradan bağımsızlık (bkz. src/symmetry.py): her split bölümü KENDİ İÇİNDE ayna
+satırlarla (takımlar yer değiştirmiş, etiket ters) genişletilir ve TÜM tahminler/
+değerlendirmeler iki sıranın ortalamasıyla (symmetric_proba) yapılır -- predict.py
+ile aynı fonksiyon, yani raporlanan metrikler servisin gerçekte ürettiği tahmini ölçer.
+
 Kullanım:
     python -m src.train --features-path data/processed/features_engineered.parquet --output-dir models
 """
@@ -43,7 +48,10 @@ from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, StandardScaler
+
+from src.symmetry import augment_with_mirror, order_asymmetry, symmetric_proba
 
 logging.basicConfig(
     level=logging.INFO,
@@ -163,6 +171,10 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
     geleceğin geçmişi tahmin etmek için kullanılmasına (leakage) yol açar. Bunun yerine
     TimeSeriesSplit kullanıyoruz: her fold'da eğitim seti SADECE validasyon setinden
     KRONOLOJİK OLARAK ÖNCEKİ verilerden oluşur (expanding window).
+
+    X_train ayna satırsız verilmeli: ayna satırlar fold'a bölündükten SONRA, sadece
+    fold'un eğitim kısmına eklenir (önceden eklense TimeSeriesSplit bir haritayı ve
+    aynasını farklı fold'lara düşürüp leakage yaratırdı).
     """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     tscv = TimeSeriesSplit(n_splits=n_splits)
@@ -180,14 +192,14 @@ def tune_xgboost_optuna(X_train: pd.DataFrame, y_train: pd.Series, n_trials: int
         }
         fold_losses = []
         for fold_train_idx, fold_val_idx in tscv.split(X_train):
-            X_tr, X_va = X_train.iloc[fold_train_idx], X_train.iloc[fold_val_idx]
-            y_tr, y_va = y_train.iloc[fold_train_idx], y_train.iloc[fold_val_idx]
+            X_tr, y_tr = augment_with_mirror(X_train.iloc[fold_train_idx], y_train.iloc[fold_train_idx])
+            X_va, y_va = X_train.iloc[fold_val_idx], y_train.iloc[fold_val_idx]
             model = xgb.XGBClassifier(
                 **params, eval_metric="logloss", enable_categorical=True,
                 tree_method="hist", random_state=42,
             )
             model.fit(X_tr, y_tr)
-            proba = model.predict_proba(X_va)[:, 1]
+            proba = symmetric_proba(model, X_va)
             fold_losses.append(log_loss(y_va, proba))
         return float(np.mean(fold_losses))
 
@@ -270,12 +282,16 @@ def train_catboost(X_train, y_train, X_val, y_val, cat_cols) -> cb.CatBoostClass
 
 def train_logistic_baseline(X_train, y_train, numeric_cols):
     """Sadece numerik feature'larla basit bir baseline -> ağaç modellerinin gerçekten
-    ekstra sinyal yakalayıp yakalamadığını anlamak için sağlama (sanity check)."""
-    X_num = X_train[numeric_cols].fillna(0.5)
-    scaler = StandardScaler().fit(X_num)
-    model = LogisticRegression(max_iter=1000)
-    model.fit(scaler.transform(X_num), y_train)
-    return model, scaler
+    ekstra sinyal yakalayıp yakalamadığını anlamak için sağlama (sanity check).
+    Tek bir pipeline olarak döner ki symmetric_proba diğer modellerle aynı şekilde
+    (ham feature tablosu üzerinden) çağırabilsin."""
+    model = make_pipeline(
+        FunctionTransformer(lambda X: X[numeric_cols].fillna(0.5)),
+        StandardScaler(),
+        LogisticRegression(max_iter=1000),
+    )
+    model.fit(X_train, y_train)
+    return model
 
 
 # --------------------------------------------------------------------------- #
@@ -366,9 +382,14 @@ def select_best_calibration(model, X_val, y_val, min_isotonic_samples: int = 500
     olasılık değerine yuvarlanmasına (çözünürlük kaybı) yol açar -- bu da API
     kullanıcısına anlamsız/güvensiz görünür. Bu yüzden validation seti yeterince
     büyük değilse isotonic aday listesinden tamamen çıkarılır.
+
+    X_val ayna satırsız verilir: kalibratörler ayna satırlarla genişletilmiş val'de
+    öğrenilir (yoksa sigmoid'in sabit terimi kaynak sıradaki 'team1 bonusunu' geri
+    öğrenirdi), seçim ise servisin ürettiği simetrik tahmin üzerinden yapılır. Isotonic
+    eşiği bağımsız harita sayısına (ayna kopyalar hariç) bakar.
     """
-    raw_val_proba = model.predict_proba(X_val)[:, 1]
-    candidates = {"raw": (model, log_loss(y_val, raw_val_proba))}
+    X_val_aug, y_val_aug = augment_with_mirror(X_val, y_val)
+    candidates = {"raw": (model, log_loss(y_val, symmetric_proba(model, X_val)))}
 
     methods = ["sigmoid"]
     if len(y_val) >= min_isotonic_samples:
@@ -381,9 +402,8 @@ def select_best_calibration(model, X_val, y_val, min_isotonic_samples: int = 500
         )
 
     for method in methods:
-        cal_model = calibrate_model(model, method, X_val, y_val)
-        val_proba = cal_model.predict_proba(X_val)[:, 1]
-        candidates[method] = (cal_model, log_loss(y_val, val_proba))
+        cal_model = calibrate_model(model, method, X_val_aug, y_val_aug)
+        candidates[method] = (cal_model, log_loss(y_val, symmetric_proba(cal_model, X_val)))
 
     for name, (_, ll) in candidates.items():
         logger.info("  [Validation] %-10s -> LogLoss: %.4f", name, ll)
@@ -437,39 +457,45 @@ def run(cfg: TrainConfig) -> None:
     X_val, y_val = get_xy(val_df, cfg, feature_cols, category_levels)
     X_test, y_test = get_xy(test_df, cfg, feature_cols, category_levels)
 
-    logger.info("Sınıf dengesi -> train: %.3f | val: %.3f | test: %.3f",
+    logger.info("Sınıf dengesi (kaynak sırası) -> train: %.3f | val: %.3f | test: %.3f",
                 y_train.mean(), y_val.mean(), y_test.mean())
+
+    # Ayna satırlar her bölüme KENDİ İÇİNDE eklenir (bkz. src/symmetry.py). Test seti
+    # genişletilmez: değerlendirme symmetric_proba ile, kaynak sıradaki etiketlerle yapılır.
+    X_train_aug, y_train_aug = augment_with_mirror(X_train, y_train)
+    X_val_aug, y_val_aug = augment_with_mirror(X_val, y_val)
 
     # ---- Baseline: Logistic Regression (sadece numerik feature'larla) ----
     numeric_cols = [c for c in cfg.numeric_features if c in df.columns]
-    log_model, scaler = train_logistic_baseline(X_train, y_train, numeric_cols)
-    logreg_proba = log_model.predict_proba(scaler.transform(X_test[numeric_cols].fillna(0.5)))[:, 1]
+    log_model = train_logistic_baseline(X_train_aug, y_train_aug, numeric_cols)
+    logreg_proba = symmetric_proba(log_model, X_test)
     results = [evaluate("Logistic Regression (baseline)", y_test, logreg_proba)]
 
     # ---- XGBoost (varsayılan hiperparametreler) ----
-    xgb_model = train_xgboost(X_train, y_train, X_val, y_val)
-    xgb_proba = xgb_model.predict_proba(X_test)[:, 1]
+    xgb_model = train_xgboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug)
+    xgb_proba = symmetric_proba(xgb_model, X_test)
     results.append(evaluate("XGBoost (varsayılan)", y_test, xgb_proba))
 
     # ---- XGBoost (Optuna ile ayarlanmış hiperparametreler) ----
     if cfg.tune_hyperparams:
         logger.info("--- Optuna hiperparametre araması başlıyor (%d deneme, %d fold, zaman-serisi CV) ---",
                     cfg.optuna_n_trials, cfg.optuna_n_splits)
+        # ayna satırsız veriliyor -- fold'lara bölündükten sonra içeride ekleniyor
         best_params = tune_xgboost_optuna(X_train, y_train, cfg.optuna_n_trials, cfg.optuna_n_splits)
-        xgb_tuned_model = train_xgboost(X_train, y_train, X_val, y_val, params=best_params)
-        xgb_tuned_proba = xgb_tuned_model.predict_proba(X_test)[:, 1]
+        xgb_tuned_model = train_xgboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, params=best_params)
+        xgb_tuned_proba = symmetric_proba(xgb_tuned_model, X_test)
         results.append(evaluate("XGBoost (Optuna-tuned)", y_test, xgb_tuned_proba))
     else:
         xgb_tuned_model = None
 
     # ---- LightGBM ----
-    lgb_model = train_lightgbm(X_train, y_train, X_val, y_val, list(cfg.categorical_features))
-    lgb_proba = lgb_model.predict_proba(X_test)[:, 1]
+    lgb_model = train_lightgbm(X_train_aug, y_train_aug, X_val_aug, y_val_aug, list(cfg.categorical_features))
+    lgb_proba = symmetric_proba(lgb_model, X_test)
     results.append(evaluate("LightGBM", y_test, lgb_proba))
 
     # ---- CatBoost ----
-    catboost_model = train_catboost(X_train, y_train, X_val, y_val, list(cfg.categorical_features))
-    catboost_proba = catboost_model.predict_proba(X_test)[:, 1]
+    catboost_model = train_catboost(X_train_aug, y_train_aug, X_val_aug, y_val_aug, list(cfg.categorical_features))
+    catboost_proba = symmetric_proba(catboost_model, X_test)
     results.append(evaluate("CatBoost", y_test, catboost_proba))
 
     results_df = pd.DataFrame(results).set_index("model")
@@ -495,8 +521,10 @@ def run(cfg: TrainConfig) -> None:
     # ---- Kalibrasyon (seçim validation'da yapılır, test setine dokunulmaz) ----
     logger.info("--- Kalibrasyon stratejisi seçiliyor (isotonic vs sigmoid vs ham) ---")
     calib_strategy, calibrated_model = select_best_calibration(best_raw_model, X_val, y_val)
-    calibrated_proba = calibrated_model.predict_proba(X_test)[:, 1]
-    raw_best_proba = best_raw_model.predict_proba(X_test)[:, 1]
+    calibrated_proba = symmetric_proba(calibrated_model, X_test)
+    raw_best_proba = symmetric_proba(best_raw_model, X_test)
+    logger.info("Sıra tutarsızlığı, ortalamadan ÖNCE (test, ort. |f(A,B)+f(B,A)-1|): %.4f "
+                "-> symmetric_proba sonrası tanım gereği 0", order_asymmetry(calibrated_model, X_test))
 
     logger.info("--- Final karşılaştırma (%s, TEST seti, kalibrasyon kararı görmeden) ---", best_name)
     evaluate(f"{best_name} (ham)", y_test, raw_best_proba)
@@ -515,8 +543,7 @@ def run(cfg: TrainConfig) -> None:
     # ---- Final fit: dağıtılacak model TÜM veriyle eğitilir ----
     if cfg.final_fit:
         logger.info("--- Final fit: %s, aynı ayarlarla TÜM veriye yeniden eğitiliyor ---", best_name)
-        X_all = pd.concat([X_train, X_val, X_test])
-        y_all = pd.concat([y_train, y_val, y_test])
+        X_all, y_all = augment_with_mirror(pd.concat([X_train, X_val, X_test]), pd.concat([y_train, y_val, y_test]))
         deployed_model, n_trees = refit_on_all_data(best_raw_model, X_all, y_all, list(cfg.categorical_features))
         # Tüm veri kullanıldığı için kalibrasyonu öğrenecek ayrı bir dönem kalmıyor; model
         # kalibrasyonsuz dağıtılıyor. Değerlendirmede kalibrasyonun katkısı ölçülüp
@@ -524,7 +551,8 @@ def run(cfg: TrainConfig) -> None:
         if calib_gain > 0.005:
             logger.warning("Kalibrasyon testte LogLoss'u %.4f iyileştirmişti; final model kalibrasyonsuz. "
                            "Bu fark büyük, yakından bak.", calib_gain)
-        deployed_desc = f"final fit (tüm veri, {len(X_all)} satır, {n_trees} ağaç, kalibrasyonsuz)"
+        deployed_desc = (f"final fit (tüm veri, {len(df)} harita + aynaları = {len(X_all)} satır, "
+                         f"{n_trees} ağaç, kalibrasyonsuz)")
         final_range = [str(df["datetime"].min()), str(df["datetime"].max())]
     else:
         deployed_model = calibrated_model
@@ -545,6 +573,7 @@ def run(cfg: TrainConfig) -> None:
         "categorical_features": list(cfg.categorical_features),
         "category_levels": category_levels,
         "target_col": cfg.target_col,
+        "order_invariance": "ayna satırlarla eğitim + tahminde iki sıranın ortalaması (src/symmetry.py)",
         "eval_train_date_range": [str(train_df["datetime"].min()), str(train_df["datetime"].max())],
         "test_date_range": [str(test_df["datetime"].min()), str(test_df["datetime"].max())],
         "test_metrics_calibrated": test_metrics,

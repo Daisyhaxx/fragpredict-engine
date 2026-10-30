@@ -37,15 +37,18 @@ api/main.py            → FastAPI service, /api/v1/predict, Supabase logging
 
 ## Results
 
-The current champion model (CatBoost, sigmoid-calibrated) evaluated on a **strictly
+The current champion model (XGBoost, sigmoid-calibrated) evaluated on a **strictly
 chronological, held-out test period** (May–Oct 2026, unseen during training):
 
 | Metric | Value |
 |---|---|
-| ROC-AUC | 0.647 |
-| Log Loss | 0.659 |
+| ROC-AUC | 0.645 |
+| Log Loss | 0.658 |
 | Brier Score | 0.233 |
-| Accuracy @ 0.5 | 60.6% |
+| Accuracy @ 0.5 | 60.7% |
+
+Predictions are **order-invariant**: "A vs B" and "B vs A" always get exactly
+complementary probabilities (see [team order bias](#limitations--lessons-learned)).
 
 For context: CS2 is a high-variance game and near-perfect prediction is not a realistic
 target. See [Limitations & Lessons Learned](#limitations--lessons-learned)
@@ -92,13 +95,20 @@ enough to prevent leakage across maps of the same series.
 │   ├── eda_cleaning.py       # step 1: cleaning & validation
 │   ├── pipeline.py           # step 2: feature engineering
 │   ├── train.py              # step 3: model training & calibration
-│   └── predict.py            # step 4: inference
+│   ├── predict.py            # step 4: inference
+│   └── symmetry.py           # team-order invariance (shared by train & predict)
 ├── api/
 │   └── main.py                # FastAPI service
+├── web/
+│   └── index.html             # single-page UI served at /
+├── deploy/huggingface/
+│   └── README.md              # Hugging Face Space config (front matter)
 ├── supabase/
 │   └── schema.sql             # predictions table DDL
 ├── models/                    # trained model artifacts + metadata
-├── requirements.txt
+├── Dockerfile                 # API + UI image (serve-only dependencies)
+├── requirements.txt           # full: pipeline + training + API
+├── requirements-serve.txt     # API only
 └── .env.example
 ```
 
@@ -135,17 +145,42 @@ python -m src.predict --team1 "Team Vitality" --team2 "Natus Vincere" --map Mira
 uvicorn api.main:app --reload --port 8000
 ```
 
-Interactive docs at `http://localhost:8000/docs`.
+Web UI at `http://localhost:8000/`, interactive docs at `http://localhost:8000/docs`.
 
 | Endpoint | Description |
 |---|---|
+| `GET /` | Web UI (`web/index.html`) |
 | `GET /health` | Service health check |
 | `GET /api/v1/teams` | List of known team names |
 | `GET /api/v1/maps` | List of known map names |
+| `GET /api/v1/model` | Model name, data range and held-out test metrics |
 | `POST /api/v1/predict` | Predict a match; logs to Supabase if configured |
 
 The API degrades gracefully if Supabase isn't configured — predictions are still
-returned, just not logged (`logged_to_db: false`).
+returned, just not logged (`logged_to_db: false`). Unknown team names and tiers are
+rejected with `400` (the CLI still allows cold-start predictions for unseen teams).
+
+## Deployment (Hugging Face Spaces)
+
+The `Dockerfile` builds a serve-only image: it copies just the champion model and the
+two parquet files the predictor reads (`maps_clean`, `matches_summary`). Startup takes
+~20 s while the snapshot tables are built; memory use is ~250 MB.
+
+```bash
+pip install -U huggingface_hub
+hf auth login
+hf repos create <user>/fragpredict --type space --sdk docker
+
+hf upload <user>/fragpredict . . --repo-type space \
+  --include "Dockerfile" --include "requirements-serve.txt" \
+  --include "api/*.py" --include "src/*.py" --include "web/*" \
+  --include "models/champion_model.pkl" --include "models/model_metadata.json" \
+  --include "data/processed/maps_clean.parquet" --include "data/processed/matches_summary.parquet"
+hf upload <user>/fragpredict deploy/huggingface/README.md README.md --repo-type space
+```
+
+Don't set `SUPABASE_URL` / `SUPABASE_KEY` in the Space unless you want every public
+request logged. After retraining, rerun the first `hf upload` to redeploy.
 
 ## Limitations & lessons learned
 
@@ -174,6 +209,19 @@ Worth being upfront about what this model can't do, not just what it can.
      *already-updated* rating as if it were pre-match — leaking that match's own
      outcome. Caught via an implausibly large jump in test ROC-AUC (0.65 → 0.78)
      and fixed by processing each match exactly once.
+- **Team order bias (found and fixed).** The team1/team2 order in the source data
+  isn't random — team1 wins ~53% of maps and usually has the higher Elo. A model
+  trained only in that order learned a ~5-point bonus for "whoever is listed first",
+  which has no basis in the data: once the features are accounted for, the position
+  effect is ≈0. Since API/UI users choose the order themselves, the same match got
+  different predictions depending on order (the favourite flipped in ~15% of test
+  matches). The fix (`src/symmetry.py`): each split is augmented with mirrored rows
+  (teams swapped, label flipped) *after* splitting, and every prediction averages both
+  orders, so P(A beats B) + P(B beats A) = 1 exactly. The model's own inconsistency
+  before averaging dropped from 6.1 to 1.9 points, and test log loss improved from
+  0.6614 (old model, random user order) to 0.6576. Fixing the order canonically
+  instead (alphabetical, or higher Elo first) also removes the order dependence but
+  wasn't more accurate.
 - **Tested but not adopted** (negative results, kept for transparency): recency-weighted
   training samples, wider Optuna search (100 trials), and Optuna-tuned CatBoost all
   *underperformed* their simpler counterparts on the held-out test set — with a

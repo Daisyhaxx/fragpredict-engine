@@ -26,11 +26,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from src.predict import Predictor, PredictConfig
@@ -48,6 +50,8 @@ logger = logging.getLogger("api")
 # Global durum (uygulama ayağa kalkarken bir kez doldurulur)
 # --------------------------------------------------------------------------- #
 state: dict = {"predictor": None, "supabase": None}
+
+WEB_INDEX = Path(__file__).resolve().parent.parent / "web" / "index.html"
 
 
 def _init_supabase():
@@ -134,6 +138,15 @@ class MapsResponse(BaseModel):
     as_of: str  # aktif havuzun hesaplandığı tarih (verideki son maç)
 
 
+class ModelInfoResponse(BaseModel):
+    model: str
+    data_from: str
+    data_to: str
+    test_from: str
+    test_to: str
+    test_metrics: dict[str, float]
+
+
 # --------------------------------------------------------------------------- #
 # Yardımcı: Supabase'e loglama (asla ana akışı bozmamalı)
 # --------------------------------------------------------------------------- #
@@ -164,6 +177,12 @@ def _log_prediction_to_supabase(result: dict) -> bool:
 # --------------------------------------------------------------------------- #
 # Endpoint'ler
 # --------------------------------------------------------------------------- #
+@app.get("/", include_in_schema=False)
+def web_ui():
+    """Test edenler için tek sayfalık arayüz (web/index.html) -- aşağıdaki API'yi kullanır."""
+    return FileResponse(WEB_INDEX)
+
+
 @app.get("/health")
 def health():
     return {
@@ -190,6 +209,21 @@ def list_maps():
     return MapsResponse(count=len(maps), maps=maps, as_of=str(predictor.map_pool_as_of.date()))
 
 
+@app.get("/api/v1/model", response_model=ModelInfoResponse)
+def model_info():
+    """Arayüzün altında gösterilen model/veri özeti (model_metadata.json'dan)."""
+    meta = state["predictor"].metadata
+    metrics = meta["test_metrics_calibrated"]
+    return ModelInfoResponse(
+        model=meta["champion_model_name"],
+        data_from=meta["deployed_train_date_range"][0][:10],
+        data_to=meta["deployed_train_date_range"][1][:10],
+        test_from=meta["test_date_range"][0][:10],
+        test_to=meta["test_date_range"][1][:10],
+        test_metrics={k: v for k, v in metrics.items() if isinstance(v, (int, float))},
+    )
+
+
 @app.post("/api/v1/predict", response_model=PredictResponse)
 def predict_match(request: PredictRequest):
     predictor: Optional[Predictor] = state.get("predictor")
@@ -200,6 +234,15 @@ def predict_match(request: PredictRequest):
         raise HTTPException(status_code=400, detail="team1 ve team2 aynı takım olamaz.")
     if request.best_of not in (1, 3, 5):
         raise HTTPException(status_code=400, detail="best_of yalnızca 1, 3 veya 5 olabilir.")
+    # Eğitimde görülmemiş tier modele NaN kategori olarak gider -> sessizce saçma tahmin.
+    valid_tiers = predictor.metadata.get("category_levels", {}).get("tier", ["tier1", "tier2", "tier3"])
+    if request.tier not in valid_tiers:
+        raise HTTPException(status_code=400, detail=f"tier yalnızca {', '.join(valid_tiers)} olabilir.")
+    # CLI bilinmeyen takımı lig ortalamasıyla (soğuk başlangıç) tahmin eder; herkese açık
+    # API'de yazım hatası sessizce anlamsız bir tahmine dönüşmesin diye reddediyoruz.
+    unknown = [t for t in (request.team1, request.team2) if t not in predictor.known_teams]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Bilinmeyen takım: {', '.join(unknown)}. Listeden seç.")
 
     try:
         result = predictor.predict(
@@ -213,8 +256,9 @@ def predict_match(request: PredictRequest):
         # Kullanıcı kaynaklı hata (ör. havuz dışı harita) -> 400
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        # Ayrıntı sadece sunucu logunda -- herkese açık yanıtta iç hata metni dönmüyoruz.
         logger.exception("Tahmin üretilirken hata oluştu.")
-        raise HTTPException(status_code=500, detail=f"Tahmin üretilemedi: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Tahmin üretilemedi, sunucu hatası.") from exc
 
     logged = _log_prediction_to_supabase(result)
 

@@ -1,12 +1,12 @@
 {
-  "champion_model_name": "CatBoost",
-  "deployed_model": "final fit (tüm veri, 12235 satır, 277 ağaç, kalibrasyonsuz)",
+  "champion_model_name": "XGBoost (varsayılan)",
+  "deployed_model": "final fit (tüm veri, 12235 harita + aynaları = 24470 satır, 154 ağaç, kalibrasyonsuz)",
   "deployed_train_date_range": [
     "2023-10-25 18:00:00",
     "2026-10-24 19:20:00"
   ],
   "calibration_strategy": "sigmoid",
-  "calibration_logloss_gain_on_test": -0.0003,
+  "calibration_logloss_gain_on_test": 0.0006,
   "feature_cols": [
     "team1_form_last5",
     "team1_form_last10",
@@ -131,6 +131,7 @@
     ]
   },
   "target_col": "team1_map_win",
+  "order_invariance": "ayna satırlarla eğitim + tahminde iki sıranın ortalaması (src/symmetry.py)",
   "eval_train_date_range": [
     "2023-10-25 18:00:00",
     "2025-11-07 13:10:00"
@@ -140,10 +141,10 @@
     "2026-10-24 19:20:00"
   ],
   "test_metrics_calibrated": {
-    "model": "CatBoost (final)",
-    "roc_auc": 0.6469112744531307,
-    "log_loss": 0.6589120161552298,
-    "brier_score": 0.2333605358648459,
-    "accuracy_at_0.5": 0.6062091503267973
+    "model": "XGBoost (varsayılan) (final)",
+    "roc_auc": 0.6451419124842224,
+    "log_loss": 0.6576480214283353,
+    "brier_score": 0.232796212247238,
+    "accuracy_at_0.5": 0.6072984749455338
   }
 }

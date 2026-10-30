@@ -1,0 +1,21 @@
+# Sadece API'yi çalıştırmak (tahmin servisi) için gereken paketler -- Dockerfile bunu kurar.
+# Eğitim/analiz paketleri (optuna, matplotlib...) requirements.txt'te.
+# Sürümler, champion_model.pkl'ın üretildiği ortamla aynı tutuldu.
+pandas==2.3.3
+numpy==2.3.5
+pyarrow==23.0.0
+scipy==1.16.3
+scikit-learn==1.7.2
+joblib==1.5.2
+
+# train.py şampiyonu her eğitimde bu üçü arasından seçiyor -- hangisi seçilirse seçilsin
+# imaj yeniden eğitimden sonra da çalışsın diye üçü de kurulu.
+# xgboost-cpu: aynı 'xgboost' modülü, ama Linux'ta ~yüzlerce MB'lık GPU (NCCL) bağımlılığı olmadan.
+xgboost-cpu==3.4.1
+lightgbm==4.7.0
+catboost==1.2.10
+
+fastapi==0.124.0
+uvicorn==0.38.0
+supabase==2.25.0
+python-dotenv==1.2.1

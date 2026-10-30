@@ -20,3 +20,8 @@ data/processed/
 # OS
 .DS_Store
 Thumbs.db
+# CatBoost eğitim çıktıları (her eğitimde yeniden yazılıyor)
+catboost_info/
+
+# Kişisel editör ayarları
+.vscode/

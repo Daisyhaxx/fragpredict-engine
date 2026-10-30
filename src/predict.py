@@ -49,6 +49,7 @@ from src.pipeline import (
     compute_current_map_elo,
     compute_current_team_state,
 )
+from src.symmetry import symmetric_proba
 
 logging.basicConfig(
     level=logging.INFO,
@@ -287,7 +288,9 @@ class Predictor:
         if team_name not in self.current_state.index:
             return {"elo": ELO_INITIAL_FALLBACK, "streak": 0.0, "rest_days": 60.0}
         row = self.current_state.loc[team_name]
-        rest_days = (pd.Timestamp.now(tz=None) - row["last_match_datetime"]).total_seconds() / 86400.0
+        # Referans BUGÜN değil verideki son maç: veri statik, now() kullanılırsa günler
+        # geçtikçe her takımın rest_days'i 60'a dayanır ve tahminler veri değişmeden kayar.
+        rest_days = (self.map_pool_as_of - row["last_match_datetime"]).total_seconds() / 86400.0
         return {
             "elo": float(row["current_elo"]),
             "streak": float(row["current_streak"]),
@@ -363,7 +366,9 @@ class Predictor:
             )
 
         X = self._build_feature_row(team1, team2, map_name, tier, best_of)
-        proba_team1 = float(self.model.predict_proba(X)[:, 1][0])
+        # İki sıranın ortalaması: "A vs B" ile "B vs A" birbirinin tam tümleyeni olur
+        # (bkz. src/symmetry.py -- train.py de metrikleri aynı fonksiyonla ölçüyor).
+        proba_team1 = float(symmetric_proba(self.model, X)[0])
 
         return {
             "team1": team1,
