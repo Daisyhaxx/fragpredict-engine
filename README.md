@@ -6,6 +6,9 @@ build the thing the way a real ML system would be put together — separate stag
 cleaning the data, engineering features, training a model, and serving predictions
 through an API, instead of one long script.
 
+**Live demo:** [fragpredict.duckdns.org](https://fragpredict.duckdns.org): pick two teams and a
+map to get a win probability.
+
 > 🇹🇷 Türkçe README için [README.tr.md](README.tr.md) dosyasına bakın.
 
 ## Overview
@@ -67,8 +70,8 @@ Source: HLTV professional match history (tier 1–3), covering **5,903 matches /
 12,235 played maps** across **483 teams** and **1,566 players**, from
 **Oct 25, 2023 to Oct 24, 2026**.
 
-Raw CSVs are not committed to this repo (see `.gitignore`) — place them under
-`data/raw/` before running the pipeline:
+The raw CSVs are included under `data/raw/` (CC BY-SA 4.0, see [Data source](#data-source)).
+To refresh the data, download the latest version from Kaggle and replace these files:
 - `cs2_all_tiers_games.csv`, `cs2_tier1_games.csv`, `cs2_tier2_games.csv`, `cs2_tier3_games.csv`
 - `teams.csv`, `players.csv`, `tournaments.csv`
 
@@ -96,8 +99,8 @@ enough to prevent leakage across maps of the same series.
 
 ```
 ├── data/
-│   ├── raw/                  # input CSVs (gitignored)
-│   └── processed/            # cleaned parquet files (gitignored)
+│   ├── raw/                  # input CSVs from Kaggle
+│   └── processed/            # cleaned parquet files (the API reads two of them)
 ├── src/
 │   ├── eda_cleaning.py       # step 1: cleaning & validation
 │   ├── pipeline.py           # step 2: feature engineering
@@ -108,15 +111,16 @@ enough to prevent leakage across maps of the same series.
 │   └── main.py                # FastAPI service
 ├── web/
 │   └── index.html             # single-page UI served at /
-├── deploy/huggingface/
-│   └── README.md              # Hugging Face Space config (front matter)
-├── supabase/
-│   └── schema.sql             # predictions table DDL
+├── deploy/
+│   ├── huggingface/
+│   │   └── README.md          # Hugging Face Space config (front matter)
+│   └── supabase/
+│       └── predictions_rls.sql # insert-only access to the predictions table
 ├── models/                    # trained model artifacts + metadata
 ├── Dockerfile                 # API + UI image (serve-only dependencies)
 ├── requirements.txt           # full: pipeline + training + API
 ├── requirements-serve.txt     # API only
-└── .env.example
+└── env.example
 ```
 
 ## Setup
@@ -125,8 +129,8 @@ enough to prevent leakage across maps of the same series.
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill in your Supabase project credentials
-(Project Settings → API).
+Copy `env.example` to `.env` and fill in your Supabase project URL and publishable key
+(Project Settings → API). Logging is optional; see [Prediction logging](#prediction-logging).
 
 ## Running the pipeline
 
@@ -159,7 +163,7 @@ Web UI at `http://localhost:8000/`, interactive docs at `http://localhost:8000/d
 | `GET /` | Web UI (`web/index.html`) |
 | `GET /health` | Service health check |
 | `GET /api/v1/teams` | List of known team names |
-| `GET /api/v1/maps` | List of known map names |
+| `GET /api/v1/maps` | Active map pool (maps played in the last 60 days) |
 | `GET /api/v1/model` | Model name, data range and held-out test metrics |
 | `POST /api/v1/predict` | Predict a match; logs to Supabase if configured |
 
@@ -167,11 +171,52 @@ The API degrades gracefully if Supabase isn't configured — predictions are sti
 returned, just not logged (`logged_to_db: false`). Unknown team names and tiers are
 rejected with `400` (the CLI still allows cold-start predictions for unseen teams).
 
-## Deployment (Hugging Face Spaces)
+## Deployment
 
 The `Dockerfile` builds a serve-only image: it copies just the champion model and the
 two parquet files the predictor reads (`maps_clean`, `matches_summary`). Startup takes
-~20 s while the snapshot tables are built; memory use is ~250 MB.
+~30 s while the snapshot tables are built; memory use is ~300 MB.
+
+### Live demo (VPS)
+
+The [live demo](https://fragpredict.duckdns.org) runs on a small VPS (2 vCPU, 4 GB RAM)
+as a Docker Compose service. The container publishes no ports. A Caddy reverse proxy on
+the same Docker network forwards the domain to it and gets the HTTPS certificate from
+Let's Encrypt automatically.
+
+```yaml
+# docker-compose.yml, next to the Dockerfile on the server
+services:
+  fragpredict:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: <caddy-network>   # the Docker network Caddy runs on
+```
+
+```
+# Caddyfile
+fragpredict.duckdns.org {
+	reverse_proxy fragpredict:7860
+}
+```
+
+To deploy a new version (for example after retraining), push it to `main` and run this
+on the server:
+
+```bash
+cd /opt/fragpredict && git pull && docker compose up -d --build
+```
+
+### Hugging Face Spaces
+
+The same image also runs as a Docker Space:
 
 ```bash
 pip install -U huggingface_hub
@@ -186,11 +231,16 @@ hf upload <user>/fragpredict . . --repo-type space \
 hf upload <user>/fragpredict deploy/huggingface/README.md README.md --repo-type space
 ```
 
+After retraining, rerun the first `hf upload` to redeploy.
+
+### Prediction logging
+
 Prediction logging is optional. To turn it on, first run
 `deploy/supabase/predictions_rls.sql` in the Supabase SQL Editor. It gives the
 publishable key (`sb_publishable_…`) insert-only access to the `predictions` table: no
-reads, updates or deletes. Then add `SUPABASE_URL` and `SUPABASE_KEY` (the publishable
-key) as **Secrets** in the Space settings. Don't use Variables, because those are
+reads, updates or deletes. Then set `SUPABASE_URL` and `SUPABASE_KEY` (the publishable
+key): on a server, in the `.env` file next to `docker-compose.yml`; on Hugging Face, as
+**Secrets** in the Space settings. Don't use Space Variables, because those are
 public. Even if the key leaked, all it could do is insert rows, which the public API
 already does.
 
@@ -200,7 +250,7 @@ Two safeguards in the API protect the table, and neither uses IP addresses:
   within 10 minutes.
 
 When a write is skipped, the prediction is still returned; only the log entry is
-dropped. After retraining, rerun the first `hf upload` to redeploy.
+dropped.
 
 ## Limitations & lessons learned
 
@@ -267,13 +317,13 @@ Worth being upfront about what this model can't do, not just what it can.
 
 The dataset is [Counter-Strike Pro Matches on Kaggle](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches)
 by ektarr, originally compiled from HLTV.org professional match history and licensed
-[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). It isn't
-redistributed in this repository. Download it from Kaggle and place the CSVs under
-`data/raw/` as described above.
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). A copy of the CSVs
+is included under `data/raw/`; the Kaggle page has the latest version.
 
-The Hugging Face Space ships two processed files derived from it (`maps_clean.parquet`
-and `matches_summary.parquet`: cleaned and restructured per match and map). Under the
-ShareAlike term, those files are licensed CC BY-SA 4.0 as well.
+This repository and the live demo also ship processed files derived from it
+(`maps_clean.parquet`, `matches_summary.parquet` and `features_engineered.parquet`:
+cleaned and restructured per match and map). Under the ShareAlike term, those files are
+licensed CC BY-SA 4.0 as well.
 
 ## License
 

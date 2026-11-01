@@ -6,6 +6,9 @@ sisteminin nasıl kurulacağını denemek için başladı — tek uzun bir scrip
 veri temizliği, feature engineering, model eğitimi ve API üzerinden tahmin
 sunumu için ayrı ayrı aşamalar.
 
+**Canlı demo:** [fragpredict.duckdns.org](https://fragpredict.duckdns.org): iki takım ve bir
+harita seç, galibiyet olasılığını gör.
+
 > 🇬🇧 For the English README, see [README.md](README.md).
 
 ## Genel Bakış
@@ -67,8 +70,9 @@ Kaynak: HLTV profesyonel maç geçmişi (tier 1-3), **5.903 maç / 12.235 oynana
 harita**, **483 takım** ve **1.566 oyuncu**, **25 Ekim 2023 – 24 Ekim 2026**
 aralığında.
 
-Ham CSV'ler bu repoya commitlenmemiştir (bkz. `.gitignore`) — pipeline'ı
-çalıştırmadan önce şunları `data/raw/` altına yerleştir:
+Ham CSV'ler repoda, `data/raw/` altında bulunuyor (CC BY-SA 4.0, bkz.
+[Veri Kaynağı](#veri-kaynağı)). Veriyi güncellemek için Kaggle'dan son sürümü indirip bu
+dosyaların yerine koy:
 - `cs2_all_tiers_games.csv`, `cs2_tier1_games.csv`, `cs2_tier2_games.csv`, `cs2_tier3_games.csv`
 - `teams.csv`, `players.csv`, `tournaments.csv`
 
@@ -97,8 +101,8 @@ aynı serinin haritaları arasındaki sızıntıyı önlemeye yetmiyor.
 
 ```
 ├── data/
-│   ├── raw/                  # girdi CSV'leri (gitignore'da)
-│   └── processed/            # temizlenmiş parquet dosyaları (gitignore'da)
+│   ├── raw/                  # Kaggle'dan gelen girdi CSV'leri
+│   └── processed/            # temizlenmiş parquet dosyaları (API ikisini okur)
 ├── src/
 │   ├── eda_cleaning.py       # adım 1: temizlik ve doğrulama
 │   ├── pipeline.py           # adım 2: feature engineering
@@ -109,15 +113,16 @@ aynı serinin haritaları arasındaki sızıntıyı önlemeye yetmiyor.
 │   └── main.py                # FastAPI servisi
 ├── web/
 │   └── index.html             # / adresinde sunulan tek sayfalık arayüz
-├── deploy/huggingface/
-│   └── README.md              # Hugging Face Space ayarları (front matter)
-├── supabase/
-│   └── schema.sql             # predictions tablosu DDL
+├── deploy/
+│   ├── huggingface/
+│   │   └── README.md          # Hugging Face Space ayarları (front matter)
+│   └── supabase/
+│       └── predictions_rls.sql # predictions tablosuna yalnızca ekleme izni
 ├── models/                    # eğitilmiş model dosyaları + metadata
 ├── Dockerfile                 # API + arayüz imajı (sadece servis bağımlılıkları)
 ├── requirements.txt           # tam liste: pipeline + eğitim + API
 ├── requirements-serve.txt     # sadece API
-└── .env.example
+└── env.example
 ```
 
 ## Kurulum
@@ -126,8 +131,9 @@ aynı serinin haritaları arasındaki sızıntıyı önlemeye yetmiyor.
 pip install -r requirements.txt
 ```
 
-`.env.example` dosyasını `.env` olarak kopyala ve Supabase proje bilgilerini
-gir (Project Settings → API).
+`env.example` dosyasını `.env` olarak kopyala ve Supabase proje URL'ini ve publishable
+anahtarını gir (Project Settings → API). Tahmin kaydı isteğe bağlı; bkz.
+[Tahmin Kaydı](#tahmin-kaydı).
 
 ## Pipeline'ı Çalıştırma
 
@@ -160,7 +166,7 @@ Web arayüzü: `http://localhost:8000/`, interaktif dokümantasyon: `http://loca
 | `GET /` | Web arayüzü (`web/index.html`) |
 | `GET /health` | Servis sağlık kontrolü |
 | `GET /api/v1/teams` | Bilinen takım isimleri listesi |
-| `GET /api/v1/maps` | Bilinen harita isimleri listesi |
+| `GET /api/v1/maps` | Aktif harita havuzu (son 60 günde oynanan haritalar) |
 | `GET /api/v1/model` | Model adı, veri aralığı ve görülmemiş test metrikleri |
 | `POST /api/v1/predict` | Maç tahmini üretir; yapılandırılmışsa Supabase'e loglar |
 
@@ -169,11 +175,52 @@ tahminler yine döner, sadece loglanmaz (`logged_to_db: false`). Bilinmeyen tak�
 ve tier değerleri `400` ile reddedilir (CLI, görülmemiş takımlar için soğuk başlangıç
 tahminine hâlâ izin veriyor).
 
-## Yayınlama (Hugging Face Spaces)
+## Yayınlama
 
 `Dockerfile` sadece servis için gereken imajı kurar: champion modeli ve predictor'ın
 okuduğu iki parquet dosyasını (`maps_clean`, `matches_summary`) kopyalar. Açılış,
-snapshot tabloları kurulurken ~20 sn sürer; bellek kullanımı ~250 MB.
+snapshot tabloları kurulurken ~30 sn sürer; bellek kullanımı ~300 MB.
+
+### Canlı Demo (VPS)
+
+[Canlı demo](https://fragpredict.duckdns.org) küçük bir VPS'te (2 vCPU, 4 GB RAM) Docker
+Compose servisi olarak çalışıyor. Container dışarıya hiç port açmıyor. Aynı Docker
+ağındaki bir Caddy reverse proxy alan adını container'a yönlendiriyor ve HTTPS
+sertifikasını Let's Encrypt'ten otomatik alıyor.
+
+```yaml
+# docker-compose.yml, sunucuda Dockerfile ile aynı klasörde
+services:
+  fragpredict:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true
+    name: <caddy-agi>   # Caddy'nin çalıştığı Docker ağı
+```
+
+```
+# Caddyfile
+fragpredict.duckdns.org {
+	reverse_proxy fragpredict:7860
+}
+```
+
+Yeni bir sürümü yayınlamak için (örneğin yeniden eğitimden sonra) değişiklikleri
+`main`'e push'la ve sunucuda şunu çalıştır:
+
+```bash
+cd /opt/fragpredict && git pull && docker compose up -d --build
+```
+
+### Hugging Face Spaces
+
+Aynı imaj Docker Space olarak da çalışır:
 
 ```bash
 pip install -U huggingface_hub
@@ -188,11 +235,16 @@ hf upload <kullanici>/fragpredict . . --repo-type space \
 hf upload <kullanici>/fragpredict deploy/huggingface/README.md README.md --repo-type space
 ```
 
+Yeniden eğitimden sonra ilk `hf upload` komutunu tekrar çalıştırman yeterli.
+
+### Tahmin Kaydı
+
 Tahmin kaydı isteğe bağlı. Açmak için önce Supabase SQL Editor'de
 `deploy/supabase/predictions_rls.sql` dosyasını çalıştır. Bu dosya publishable
 anahtara (`sb_publishable_…`) `predictions` tablosunda yalnızca satır ekleme izni
-verir; okuma, güncelleme ve silme izni yoktur. Sonra Space ayarlarında `SUPABASE_URL`
-ve `SUPABASE_KEY` (publishable anahtar) değerlerini **Secret** olarak ekle. Variable
+verir; okuma, güncelleme ve silme izni yoktur. Sonra `SUPABASE_URL` ve `SUPABASE_KEY`
+(publishable anahtar) değerlerini gir: sunucuda `docker-compose.yml` ile aynı klasördeki
+`.env` dosyasına, Hugging Face'te Space ayarlarına **Secret** olarak. Space Variable'ı
 olarak ekleme, çünkü Variable'lar herkese açıktır. Anahtar sızsa bile yapılabilecek tek
 şey satır eklemek olur; bunu herkese açık API zaten yapıyor.
 
@@ -201,8 +253,7 @@ API'de tabloyu koruyan iki önlem var, ikisi de IP adresi kullanmıyor:
 - **Tekrar kontrolü:** Aynı maç ve harita, takım sırası ne olursa olsun, 10 dakika
   içinde tekrar kaydedilmez.
 
-Bir kayıt atlandığında tahmin yine döner, yalnızca o kayıt yazılmaz. Yeniden
-eğitimden sonra ilk `hf upload` komutunu tekrar çalıştırman yeterli.
+Bir kayıt atlandığında tahmin yine döner, yalnızca o kayıt yazılmaz.
 
 ## Sınırlamalar ve Çıkarılan Dersler
 
@@ -274,14 +325,13 @@ Modelin ne yapamadığını da açıkça söylemekte fayda var, sadece ne yaptı
 
 Veri seti, ektarr'ın [Kaggle'daki Counter-Strike Pro Matches](https://www.kaggle.com/datasets/ektarr/counter-strike-pro-matches)
 veri seti. Aslen HLTV.org profesyonel maç geçmişinden derlenmiş ve
-[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) lisanslı. Bu repoda
-yeniden dağıtılmıyor; Kaggle'dan indirip CSV'leri yukarıda anlatıldığı gibi `data/raw/`
-altına yerleştir.
+[CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) lisanslı. CSV'lerin bir
+kopyası `data/raw/` altında bulunuyor; en güncel sürüm Kaggle sayfasında.
 
-Hugging Face Space'te bu veriden türetilmiş iki işlenmiş dosya var: `maps_clean.parquet`
-ve `matches_summary.parquet` (temizlenmiş, maç ve harita düzeyinde yeniden
-düzenlenmiş). Lisansın "aynı lisansla paylaş" şartı gereği bu dosyalar da CC BY-SA 4.0
-ile paylaşılıyor.
+Bu repoda ve canlı demoda bu veriden türetilmiş işlenmiş dosyalar da var:
+`maps_clean.parquet`, `matches_summary.parquet` ve `features_engineered.parquet`
+(temizlenmiş, maç ve harita düzeyinde yeniden düzenlenmiş). Lisansın "aynı lisansla
+paylaş" şartı gereği bu dosyalar da CC BY-SA 4.0 ile paylaşılıyor.
 
 ## Lisans
 
